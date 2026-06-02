@@ -1,0 +1,19 @@
+{
+  "name": "api-police",
+  "version": "0.1.0",
+  "private": true,
+  "description": "API Fastify anti-fraude bagages (déploiement autonome)",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "start": "npm run start -w @police/api",
+    "dev": "npm run dev -w @police/api",
+    "build": "npm run build -w @police/shared && npm run build -w @police/bcbp-parser && npm run build -w @police/api",
+    "typecheck": "npm run typecheck -w @police/api"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
