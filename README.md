@@ -31,10 +31,24 @@ PORT=3001
 
 ## Démarrage
 
+L'API est bundlée en un seul fichier JS autonome (`server.js`) — code de
+`shared` + `bcbp-parser` inliné, `fastify`/`@supabase/supabase-js`/`bcbp` en
+dépendances npm. Aucun TypeScript ni résolution de workspace au runtime.
+
 ```bash
-npm start            # lance @police/api (tsx)
+npm start            # = node server.js
 ```
 
-> Note : le script `start` de l'API utilise `--env-file=.env`. En production
-> sans fichier `.env`, retire ce flag et fournis les variables via l'environnement
-> de l'hébergeur.
+Regénérer le bundle après modification du code source :
+
+```bash
+npm run build        # esbuild → server.js
+```
+
+### Déploiement Hostinger (preset Express)
+
+- Fichier d'entrée : `server.js`
+- Répertoire root : `./`
+- Le serveur écoute sur `process.env.PORT` (injecté par l'hébergeur) — ne pas
+  forcer `PORT` à la main.
+- Variables d'env requises : `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.

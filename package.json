@@ -4,14 +4,23 @@
   "private": true,
   "description": "API Fastify anti-fraude bagages (déploiement autonome)",
   "type": "module",
+  "main": "server.js",
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
-    "start": "npm run start -w @police/api",
+    "start": "node server.js",
     "dev": "npm run dev -w @police/api",
-    "build": "npm run build -w @police/shared && npm run build -w @police/bcbp-parser && npm run build -w @police/api",
+    "build": "esbuild packages/api/src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=server.js --external:fastify --external:@supabase/supabase-js --external:bcbp",
     "typecheck": "npm run typecheck -w @police/api"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.47.10",
+    "bcbp": "^6.0.2",
+    "fastify": "^5.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
   },
   "engines": {
     "node": ">=20"
