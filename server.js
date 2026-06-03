@@ -324,6 +324,51 @@ async function scanRoutes(app2) {
     }
     return reply.send(decision.result);
   });
+  app2.post("/scan/embarquement", async (request, reply) => {
+    const { raw, flightId, scannedBy } = request.body;
+    if (!raw || !flightId) {
+      return reply.code(400).send({ error: "raw et flightId sont requis" });
+    }
+    const parsed = parseBoardingPass(raw);
+    const supabase = getSupabase();
+    const { data: flight, error: flightErr } = await supabase.from("flights").select("flight_number").eq("id", flightId).single();
+    if (flightErr || !flight) {
+      return reply.code(404).send({ error: "Vol introuvable" });
+    }
+    if (!flightNumbersMatch(parsed.flightNumber, flight.flight_number)) {
+      const result2 = {
+        status: "rejected",
+        message: `\u26A0\uFE0F Boarding pass ${parsed.flightNumber || "\u2014"} \u2014 vol ${flight.flight_number}. Mauvais vol.`
+      };
+      return reply.send(result2);
+    }
+    const { data: passenger } = await supabase.from("passengers").select("id, full_name, seat, boarded").eq("flight_id", flightId).eq("pnr", parsed.pnr).eq("seat", parsed.seat).maybeSingle();
+    if (!passenger) {
+      const result2 = {
+        status: "rejected",
+        message: "\u26A0\uFE0F Passager non enregistr\xE9 \u2014 check-in requis avant embarquement."
+      };
+      return reply.send(result2);
+    }
+    const alreadyBoarded = passenger.boarded === true;
+    if (!alreadyBoarded) {
+      await supabase.from("passengers").update({ boarded: true, boarded_at: (/* @__PURE__ */ new Date()).toISOString(), boarded_by: scannedBy ?? null }).eq("id", passenger.id);
+    }
+    const [{ count: registered }, { count: boarded }] = await Promise.all([
+      supabase.from("passengers").select("id", { count: "exact", head: true }).eq("flight_id", flightId),
+      supabase.from("passengers").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("boarded", true)
+    ]);
+    const reg = registered ?? 0;
+    const brd = boarded ?? 0;
+    const result = {
+      status: "accepted",
+      passengerName: passenger.full_name,
+      seat: passenger.seat ?? "\u2014",
+      alreadyBoarded,
+      counts: { registered: reg, boarded: brd, remaining: Math.max(reg - brd, 0) }
+    };
+    return reply.send(result);
+  });
 }
 
 // packages/api/src/server.ts

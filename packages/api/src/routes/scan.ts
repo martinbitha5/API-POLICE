@@ -1,10 +1,16 @@
 import type { FastifyInstance } from 'fastify';
 import { parseBoardingPass, parseBaggageTag } from '@police/bcbp-parser';
-import { flightNumbersMatch } from '@police/shared';
+import { flightNumbersMatch, type BoardingGateResult } from '@police/shared';
 import { getSupabase } from '../supabase.js';
 import { evaluateBaggageScan, type BaggageScanContext } from '../fraud.js';
 
 interface BoardingBody {
+  raw: string;
+  flightId: string;
+  scannedBy?: string;
+}
+
+interface EmbarquementBody {
   raw: string;
   flightId: string;
   scannedBy?: string;
@@ -214,5 +220,84 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return reply.send(decision.result);
+  });
+
+  // ── POST /scan/embarquement ─────────────────────────────────
+  // Confirme qu'un passager DÉJÀ enregistré (check-in) monte à bord.
+  // Pas de logique anti-fraude ici : on marque seulement boarded=true et on
+  // renvoie le compteur "reste à embarquer". Un boarding pass d'un passager
+  // non enregistré est refusé (le check-in doit précéder l'embarquement).
+  app.post<{ Body: EmbarquementBody }>('/scan/embarquement', async (request, reply) => {
+    const { raw, flightId, scannedBy } = request.body;
+    if (!raw || !flightId) {
+      return reply.code(400).send({ error: 'raw et flightId sont requis' });
+    }
+
+    const parsed = parseBoardingPass(raw);
+    const supabase = getSupabase();
+
+    const { data: flight, error: flightErr } = await supabase
+      .from('flights')
+      .select('flight_number')
+      .eq('id', flightId)
+      .single();
+
+    if (flightErr || !flight) {
+      return reply.code(404).send({ error: 'Vol introuvable' });
+    }
+
+    if (!flightNumbersMatch(parsed.flightNumber, flight.flight_number)) {
+      const result: BoardingGateResult = {
+        status: 'rejected',
+        message: `⚠️ Boarding pass ${parsed.flightNumber || '—'} — vol ${flight.flight_number}. Mauvais vol.`,
+      };
+      return reply.send(result);
+    }
+
+    // Identité passager dans un vol = PNR + siège (même clé qu'au check-in).
+    const { data: passenger } = await supabase
+      .from('passengers')
+      .select('id, full_name, seat, boarded')
+      .eq('flight_id', flightId)
+      .eq('pnr', parsed.pnr)
+      .eq('seat', parsed.seat)
+      .maybeSingle();
+
+    if (!passenger) {
+      const result: BoardingGateResult = {
+        status: 'rejected',
+        message: '⚠️ Passager non enregistré — check-in requis avant embarquement.',
+      };
+      return reply.send(result);
+    }
+
+    const alreadyBoarded = passenger.boarded === true;
+    if (!alreadyBoarded) {
+      await supabase
+        .from('passengers')
+        .update({ boarded: true, boarded_at: new Date().toISOString(), boarded_by: scannedBy ?? null })
+        .eq('id', passenger.id);
+    }
+
+    // Compteurs du vol (après mise à jour).
+    const [{ count: registered }, { count: boarded }] = await Promise.all([
+      supabase.from('passengers').select('id', { count: 'exact', head: true }).eq('flight_id', flightId),
+      supabase
+        .from('passengers')
+        .select('id', { count: 'exact', head: true })
+        .eq('flight_id', flightId)
+        .eq('boarded', true),
+    ]);
+
+    const reg = registered ?? 0;
+    const brd = boarded ?? 0;
+    const result: BoardingGateResult = {
+      status: 'accepted',
+      passengerName: passenger.full_name,
+      seat: passenger.seat ?? '—',
+      alreadyBoarded,
+      counts: { registered: reg, boarded: brd, remaining: Math.max(reg - brd, 0) },
+    };
+    return reply.send(result);
   });
 }

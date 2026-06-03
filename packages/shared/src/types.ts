@@ -90,6 +90,10 @@ export interface Passenger {
   raw_bcbp: string | null;
   scanned_at: string;
   scanned_by: string | null;
+  /** true = passager physiquement embarqué (boarding pass scanné à la porte). */
+  boarded: boolean;
+  boarded_at: string | null;
+  boarded_by: string | null;
 }
 
 export interface PassengerLeg {
@@ -153,6 +157,36 @@ export interface BaggageScanRejected {
 }
 
 export type BaggageScanResult = BaggageScanAccepted | BaggageScanRejected;
+
+// ─────────────────────────────────────────────────────────────
+// Embarquement à la porte (boarding pass scanné au gate)
+// ─────────────────────────────────────────────────────────────
+
+/** Compteurs d'embarquement d'un vol. reste = registered − boarded. */
+export interface BoardingCounts {
+  /** Passagers enregistrés au check-in. */
+  registered: number;
+  /** Passagers physiquement embarqués. */
+  boarded: number;
+  /** Reste à embarquer (registered − boarded). */
+  remaining: number;
+}
+
+export interface BoardingGateAccepted {
+  status: 'accepted';
+  passengerName: string;
+  seat: string;
+  /** true = ce passager était déjà marqué embarqué (re-scan). */
+  alreadyBoarded: boolean;
+  counts: BoardingCounts;
+}
+
+export interface BoardingGateRejected {
+  status: 'rejected';
+  message: string;
+}
+
+export type BoardingGateResult = BoardingGateAccepted | BoardingGateRejected;
 
 // ─────────────────────────────────────────────────────────────
 // Suivi bagage côté passager (app tracking, public)
