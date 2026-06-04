@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { parseBoardingPass, parseBaggageTag } from '@police/bcbp-parser';
-import { flightNumbersMatch, type BoardingGateResult } from '@police/shared';
+import { flightNumbersMatch, type BoardingGateResult, type BaggageActionResult } from '@police/shared';
 import { getSupabase } from '../supabase.js';
 import { evaluateBaggageScan, type BaggageScanContext } from '../fraud.js';
 
@@ -20,6 +20,12 @@ interface BaggageBody {
   tag: string;
   flightId: string;
   gate?: string;
+  scannedBy?: string;
+}
+
+interface BaggageActionBody {
+  tag: string;
+  flightId: string;
   scannedBy?: string;
 }
 
@@ -220,6 +226,93 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return reply.send(decision.result);
+  });
+
+  // ── Action soute partagée : Charger (in_hold) / Rush (rush) ──
+  // Marque un bagage déjà enregistré (is_confirmed) au tapis :
+  //  • in_hold = chargé en soute pour la destination.
+  //  • rush    = restant, à réacheminer sur le prochain vol.
+  async function markBaggage(
+    field: 'in_hold' | 'rush',
+    body: BaggageActionBody,
+  ): Promise<{ code: number; result: BaggageActionResult }> {
+    const { tag, flightId, scannedBy } = body;
+    if (!tag || !flightId) {
+      return { code: 400, result: { status: 'rejected', message: 'tag et flightId sont requis' } };
+    }
+
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return { code: 400, result: { status: 'rejected', message: (e as Error).message } };
+    }
+
+    const supabase = getSupabase();
+
+    // Bagage de ce vol par n° de série (clé de liaison) ; on privilégie une ligne confirmée.
+    const { data: bagRow } = await supabase
+      .from('baggage')
+      .select('id, passenger_id, is_confirmed')
+      .eq('flight_id', flightId)
+      .eq('serial_number', parsedTag.serialNumber)
+      .order('is_confirmed', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!bagRow) {
+      return { code: 200, result: { status: 'rejected', message: 'Bagage inconnu sur ce vol.' } };
+    }
+    if (!bagRow.is_confirmed) {
+      return {
+        code: 200,
+        result: { status: 'rejected', message: 'Bagage non enregistré au tapis — confirmez-le d’abord.' },
+      };
+    }
+
+    const stamp = new Date().toISOString();
+    const patch =
+      field === 'in_hold'
+        ? { in_hold: true, in_hold_at: stamp, in_hold_by: scannedBy ?? null }
+        : { rush: true, rush_at: stamp, rush_by: scannedBy ?? null };
+    await supabase.from('baggage').update({ ...patch, tag_number: tag }).eq('id', bagRow.id);
+
+    // Contexte passager + compteurs.
+    const { data: pax } = await supabase
+      .from('passengers')
+      .select('full_name, declared_baggage_count')
+      .eq('id', bagRow.passenger_id)
+      .single();
+    const { count } = await supabase
+      .from('baggage')
+      .select('id', { count: 'exact', head: true })
+      .eq('passenger_id', bagRow.passenger_id)
+      .eq(field, true);
+
+    const verb = field === 'in_hold' ? 'chargé en soute' : 'marqué pour réacheminement';
+    return {
+      code: 200,
+      result: {
+        status: 'accepted',
+        passengerName: pax?.full_name ?? '—',
+        tagNumber: tag,
+        count: count ?? 0,
+        declaredCount: pax?.declared_baggage_count ?? 0,
+        message: `Bagage ${verb}.`,
+      },
+    };
+  }
+
+  // ── POST /scan/load ─── Charger un bagage en soute ──────────
+  app.post<{ Body: BaggageActionBody }>('/scan/load', async (request, reply) => {
+    const { code, result } = await markBaggage('in_hold', request.body);
+    return reply.code(code).send(result);
+  });
+
+  // ── POST /scan/rush ─── Marquer pour réacheminement ─────────
+  app.post<{ Body: BaggageActionBody }>('/scan/rush', async (request, reply) => {
+    const { code, result } = await markBaggage('rush', request.body);
+    return reply.code(code).send(result);
   });
 
   // ── POST /scan/embarquement ─────────────────────────────────

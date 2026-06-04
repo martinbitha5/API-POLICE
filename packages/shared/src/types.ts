@@ -7,7 +7,24 @@
 
 export type UserRole = 'admin' | 'supervisor' | 'agent';
 
-export type FlightStatus = 'scheduled' | 'boarding' | 'closed';
+export type FlightStatus = 'scheduled' | 'boarding' | 'closed' | 'cancelled';
+
+/** Libellés français des statuts de vol (partagés web / public / mobile). */
+export const FLIGHT_STATUS_LABEL: Record<FlightStatus, string> = {
+  scheduled: 'Programmé',
+  boarding: 'Embarquement',
+  closed: 'Fermé',
+  cancelled: 'Annulé',
+} as const;
+
+/** Statut d'un dossier de litige bagage. */
+export type DisputeStatus = 'open' | 'investigating' | 'resolved';
+
+export const DISPUTE_STATUS_LABEL: Record<DisputeStatus, string> = {
+  open: 'Ouvert',
+  investigating: 'En cours',
+  resolved: 'Résolu',
+} as const;
 
 /** Raisons de rejet d'un bagage (règles anti-fraude 1 à 5). */
 export const FRAUD_REASON = {
@@ -19,6 +36,18 @@ export const FRAUD_REASON = {
 } as const;
 
 export type FraudReason = (typeof FRAUD_REASON)[keyof typeof FRAUD_REASON];
+
+/** Catégories de réclamation passager (app tracking → litige). */
+export type ClaimCategory = 'missing' | 'damaged' | 'contents' | 'delayed' | 'other';
+
+/** Libellé français stocké en base (l'app litige est en français). */
+export const CLAIM_CATEGORY_LABEL: Record<ClaimCategory, string> = {
+  missing: 'Bagage manquant',
+  damaged: 'Bagage endommagé',
+  contents: 'Objet manquant dans le bagage',
+  delayed: 'Bagage retardé',
+  other: 'Autre problème',
+} as const;
 
 // ─────────────────────────────────────────────────────────────
 // Résultats de parsing
@@ -114,6 +143,14 @@ export interface Baggage {
   airline_numeric_code: string | null;
   serial_number: string | null;
   is_confirmed: boolean;
+  /** true = bagage chargé en soute pour la destination (fonction « Charger »). */
+  in_hold: boolean;
+  in_hold_at: string | null;
+  in_hold_by: string | null;
+  /** true = bagage restant marqué pour réacheminement sur le prochain vol. */
+  rush: boolean;
+  rush_at: string | null;
+  rush_by: string | null;
   scanned_at: string;
   scanned_by: string | null;
 }
@@ -137,6 +174,23 @@ export interface AirlineCode {
   name: string | null;
 }
 
+export interface BaggageDispute {
+  id: string;
+  baggage_id: string | null;
+  flight_id: string | null;
+  passenger_id: string | null;
+  tag_number: string | null;
+  status: DisputeStatus;
+  reason: string | null;
+  notes: string | null;
+  /** true = ouvert via une réclamation passager (app tracking), pas par un superviseur. */
+  from_passenger: boolean;
+  created_by: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Résultats d'opérations de scan (api → clients)
 // ─────────────────────────────────────────────────────────────
@@ -157,6 +211,27 @@ export interface BaggageScanRejected {
 }
 
 export type BaggageScanResult = BaggageScanAccepted | BaggageScanRejected;
+
+// ─────────────────────────────────────────────────────────────
+// Actions soute : Charger (in_hold) / Rush (réacheminement)
+// ─────────────────────────────────────────────────────────────
+
+export interface BaggageActionAccepted {
+  status: 'accepted';
+  passengerName: string;
+  tagNumber: string;
+  /** Nombre de bagages de ce passager déjà dans cet état (chargés ou rush). */
+  count: number;
+  declaredCount: number;
+  message: string;
+}
+
+export interface BaggageActionRejected {
+  status: 'rejected';
+  message: string;
+}
+
+export type BaggageActionResult = BaggageActionAccepted | BaggageActionRejected;
 
 // ─────────────────────────────────────────────────────────────
 // Embarquement à la porte (boarding pass scanné au gate)
@@ -192,14 +267,29 @@ export type BoardingGateResult = BoardingGateAccepted | BoardingGateRejected;
 // Suivi bagage côté passager (app tracking, public)
 // ─────────────────────────────────────────────────────────────
 
-/** État d'un bagage du point de vue passager. */
-export type BaggageStatus = 'loaded' | 'pending';
+/**
+ * État d'un bagage du point de vue passager (du plus avancé au moins avancé) :
+ *  • rush       : restant, marqué pour réacheminement sur le prochain vol.
+ *  • loaded     : chargé en soute pour la destination.
+ *  • registered : étiquette scannée au tapis (enregistré, anti-fraude OK).
+ *  • pending    : déclaré mais pas encore scanné.
+ */
+export type BaggageStatus = 'pending' | 'registered' | 'loaded' | 'rush';
+
+export const BAGGAGE_STATUS_LABEL: Record<BaggageStatus, string> = {
+  pending: 'En attente',
+  registered: 'Enregistré',
+  loaded: 'Chargé en soute',
+  rush: 'Réacheminement',
+} as const;
 
 export interface TrackedBag {
   tagNumber: string;
-  /** true = étiquette physique scannée au tapis (bagage chargé). */
   status: BaggageStatus;
+  /** Date du dernier événement pertinent (chargement, enregistrement…). */
   scannedAt: string | null;
+  /** Statut du litige/réclamation si le passager a signalé un problème, sinon null. */
+  claimStatus: DisputeStatus | null;
 }
 
 export interface TrackedPassenger {
@@ -227,3 +317,19 @@ export interface BaggageTrackingNotFound {
 }
 
 export type BaggageTrackingResult = BaggageTrackingFound | BaggageTrackingNotFound;
+
+// ─────────────────────────────────────────────────────────────
+// Réclamation passager (app tracking → litige superviseur)
+// ─────────────────────────────────────────────────────────────
+
+export interface BaggageClaimAccepted {
+  status: 'accepted';
+  message: string;
+}
+
+export interface BaggageClaimRejected {
+  status: 'rejected';
+  message: string;
+}
+
+export type BaggageClaimResult = BaggageClaimAccepted | BaggageClaimRejected;

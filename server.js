@@ -324,6 +324,54 @@ async function scanRoutes(app2) {
     }
     return reply.send(decision.result);
   });
+  async function markBaggage(field, body) {
+    const { tag, flightId, scannedBy } = body;
+    if (!tag || !flightId) {
+      return { code: 400, result: { status: "rejected", message: "tag et flightId sont requis" } };
+    }
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return { code: 400, result: { status: "rejected", message: e.message } };
+    }
+    const supabase = getSupabase();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    if (!bagRow) {
+      return { code: 200, result: { status: "rejected", message: "Bagage inconnu sur ce vol." } };
+    }
+    if (!bagRow.is_confirmed) {
+      return {
+        code: 200,
+        result: { status: "rejected", message: "Bagage non enregistr\xE9 au tapis \u2014 confirmez-le d\u2019abord." }
+      };
+    }
+    const stamp = (/* @__PURE__ */ new Date()).toISOString();
+    const patch = field === "in_hold" ? { in_hold: true, in_hold_at: stamp, in_hold_by: scannedBy ?? null } : { rush: true, rush_at: stamp, rush_by: scannedBy ?? null };
+    await supabase.from("baggage").update({ ...patch, tag_number: tag }).eq("id", bagRow.id);
+    const { data: pax } = await supabase.from("passengers").select("full_name, declared_baggage_count").eq("id", bagRow.passenger_id).single();
+    const { count } = await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", bagRow.passenger_id).eq(field, true);
+    const verb = field === "in_hold" ? "charg\xE9 en soute" : "marqu\xE9 pour r\xE9acheminement";
+    return {
+      code: 200,
+      result: {
+        status: "accepted",
+        passengerName: pax?.full_name ?? "\u2014",
+        tagNumber: tag,
+        count: count ?? 0,
+        declaredCount: pax?.declared_baggage_count ?? 0,
+        message: `Bagage ${verb}.`
+      }
+    };
+  }
+  app2.post("/scan/load", async (request, reply) => {
+    const { code, result } = await markBaggage("in_hold", request.body);
+    return reply.code(code).send(result);
+  });
+  app2.post("/scan/rush", async (request, reply) => {
+    const { code, result } = await markBaggage("rush", request.body);
+    return reply.code(code).send(result);
+  });
   app2.post("/scan/embarquement", async (request, reply) => {
     const { raw, flightId, scannedBy } = request.body;
     if (!raw || !flightId) {
