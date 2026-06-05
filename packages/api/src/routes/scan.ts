@@ -1,6 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { parseBoardingPass, parseBaggageTag } from '@police/bcbp-parser';
-import { flightNumbersMatch, type BoardingGateResult, type BaggageActionResult } from '@police/shared';
+import {
+  flightNumbersMatch,
+  type BoardingGateResult,
+  type BaggageActionResult,
+  type BaggageLoadAllResult,
+} from '@police/shared';
 import { getSupabase } from '../supabase.js';
 import { evaluateBaggageScan, type BaggageScanContext } from '../fraud.js';
 
@@ -303,16 +308,57 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     };
   }
 
-  // ── POST /scan/load ─── Charger un bagage en soute ──────────
-  app.post<{ Body: BaggageActionBody }>('/scan/load', async (request, reply) => {
-    const { code, result } = await markBaggage('in_hold', request.body);
-    return reply.code(code).send(result);
-  });
-
-  // ── POST /scan/rush ─── Marquer pour réacheminement ─────────
+  // ── POST /scan/rush ─── Marquer un bagage pour réacheminement ─
   app.post<{ Body: BaggageActionBody }>('/scan/rush', async (request, reply) => {
     const { code, result } = await markBaggage('rush', request.body);
     return reply.code(code).send(result);
+  });
+
+  // ── POST /scan/load-all ─── Charger en soute (groupé, sans scan) ─
+  // Pousse en soute tous les bagages enregistrés (is_confirmed) et NON marqués
+  // rush. Le flux : on scanne d'abord les bagages rush (restants), puis on
+  // charge le reste d'un coup avec cette action.
+  app.post<{ Body: { flightId: string; scannedBy?: string } }>('/scan/load-all', async (request, reply) => {
+    const { flightId, scannedBy } = request.body;
+    if (!flightId) {
+      return reply.code(400).send({ status: 'rejected', message: 'flightId est requis' } satisfies BaggageLoadAllResult);
+    }
+    const supabase = getSupabase();
+
+    // État courant des bagages confirmés du vol.
+    const { data: rows } = await supabase
+      .from('baggage')
+      .select('id, in_hold, rush')
+      .eq('flight_id', flightId)
+      .eq('is_confirmed', true);
+    const bags = (rows as { id: string; in_hold: boolean; rush: boolean }[] | null) ?? [];
+
+    const confirmed = bags.length;
+    const rushed = bags.filter((b) => b.rush).length;
+    const alreadyLoaded = bags.filter((b) => b.in_hold && !b.rush).length;
+    const toLoad = bags.filter((b) => !b.in_hold && !b.rush).map((b) => b.id);
+
+    if (toLoad.length > 0) {
+      await supabase
+        .from('baggage')
+        .update({ in_hold: true, in_hold_at: new Date().toISOString(), in_hold_by: scannedBy ?? null })
+        .in('id', toLoad);
+    }
+
+    const result: BaggageLoadAllResult = {
+      status: 'accepted',
+      loaded: toLoad.length,
+      alreadyLoaded,
+      rushed,
+      confirmed,
+      message:
+        toLoad.length > 0
+          ? `${toLoad.length} bagage(s) chargé(s) en soute.`
+          : confirmed === 0
+            ? 'Aucun bagage enregistré à charger.'
+            : 'Tous les bagages éligibles sont déjà chargés.',
+    };
+    return reply.send(result);
   });
 
   // ── POST /scan/embarquement ─────────────────────────────────

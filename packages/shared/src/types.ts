@@ -233,6 +233,30 @@ export interface BaggageActionRejected {
 
 export type BaggageActionResult = BaggageActionAccepted | BaggageActionRejected;
 
+/**
+ * Chargement groupé en soute (fonction « Charger ») : pas de scan, on pousse
+ * d'un coup tous les bagages enregistrés non-rush du vol.
+ */
+export interface BaggageLoadAllAccepted {
+  status: 'accepted';
+  /** Bagages nouvellement chargés par cette action. */
+  loaded: number;
+  /** Bagages déjà chargés avant l'action. */
+  alreadyLoaded: number;
+  /** Bagages exclus car marqués rush (réacheminement). */
+  rushed: number;
+  /** Total des bagages enregistrés (confirmés) du vol. */
+  confirmed: number;
+  message: string;
+}
+
+export interface BaggageLoadAllRejected {
+  status: 'rejected';
+  message: string;
+}
+
+export type BaggageLoadAllResult = BaggageLoadAllAccepted | BaggageLoadAllRejected;
+
 // ─────────────────────────────────────────────────────────────
 // Embarquement à la porte (boarding pass scanné au gate)
 // ─────────────────────────────────────────────────────────────

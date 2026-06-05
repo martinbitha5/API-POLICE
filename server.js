@@ -364,13 +364,34 @@ async function scanRoutes(app2) {
       }
     };
   }
-  app2.post("/scan/load", async (request, reply) => {
-    const { code, result } = await markBaggage("in_hold", request.body);
-    return reply.code(code).send(result);
-  });
   app2.post("/scan/rush", async (request, reply) => {
     const { code, result } = await markBaggage("rush", request.body);
     return reply.code(code).send(result);
+  });
+  app2.post("/scan/load-all", async (request, reply) => {
+    const { flightId, scannedBy } = request.body;
+    if (!flightId) {
+      return reply.code(400).send({ status: "rejected", message: "flightId est requis" });
+    }
+    const supabase = getSupabase();
+    const { data: rows } = await supabase.from("baggage").select("id, in_hold, rush").eq("flight_id", flightId).eq("is_confirmed", true);
+    const bags = rows ?? [];
+    const confirmed = bags.length;
+    const rushed = bags.filter((b) => b.rush).length;
+    const alreadyLoaded = bags.filter((b) => b.in_hold && !b.rush).length;
+    const toLoad = bags.filter((b) => !b.in_hold && !b.rush).map((b) => b.id);
+    if (toLoad.length > 0) {
+      await supabase.from("baggage").update({ in_hold: true, in_hold_at: (/* @__PURE__ */ new Date()).toISOString(), in_hold_by: scannedBy ?? null }).in("id", toLoad);
+    }
+    const result = {
+      status: "accepted",
+      loaded: toLoad.length,
+      alreadyLoaded,
+      rushed,
+      confirmed,
+      message: toLoad.length > 0 ? `${toLoad.length} bagage(s) charg\xE9(s) en soute.` : confirmed === 0 ? "Aucun bagage enregistr\xE9 \xE0 charger." : "Tous les bagages \xE9ligibles sont d\xE9j\xE0 charg\xE9s."
+    };
+    return reply.send(result);
   });
   app2.post("/scan/embarquement", async (request, reply) => {
     const { raw, flightId, scannedBy } = request.body;
