@@ -7,13 +7,21 @@
 
 export type UserRole = 'admin' | 'supervisor' | 'agent';
 
+/** Compartiment soute de l'avion (avant / arrière). */
+export type SoutePosition = 'avant' | 'arriere';
+
+export const SOUTE_LABEL: Record<SoutePosition, string> = {
+  avant: 'Soute avant',
+  arriere: 'Soute arrière',
+} as const;
+
 export type FlightStatus = 'scheduled' | 'boarding' | 'closed' | 'cancelled';
 
 /** Libellés français des statuts de vol (partagés web / public / mobile). */
 export const FLIGHT_STATUS_LABEL: Record<FlightStatus, string> = {
   scheduled: 'Programmé',
   boarding: 'Embarquement',
-  closed: 'Fermé',
+  closed: 'Porte fermée',
   cancelled: 'Annulé',
 } as const;
 
@@ -90,6 +98,8 @@ export interface Profile {
   full_name: string;
   role: UserRole;
   gate: string | null;
+  airport_code: string | null;
+  airline_code: string | null;
   created_at: string;
 }
 
@@ -151,6 +161,10 @@ export interface Baggage {
   rush: boolean;
   rush_at: string | null;
   rush_by: string | null;
+  /** Compartiment soute où le bagage a été placé (null = pas encore scanné en soute). */
+  soute: SoutePosition | null;
+  soute_at: string | null;
+  soute_by: string | null;
   scanned_at: string;
   scanned_by: string | null;
 }

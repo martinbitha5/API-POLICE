@@ -5,6 +5,7 @@ import {
   type BoardingGateResult,
   type BaggageActionResult,
   type BaggageLoadAllResult,
+  type SoutePosition,
 } from '@police/shared';
 import { getSupabase } from '../supabase.js';
 import { evaluateBaggageScan, type BaggageScanContext } from '../fraud.js';
@@ -31,6 +32,13 @@ interface BaggageBody {
 interface BaggageActionBody {
   tag: string;
   flightId: string;
+  scannedBy?: string;
+}
+
+interface SouteBody {
+  tag: string;
+  flightId: string;
+  soute: SoutePosition;
   scannedBy?: string;
 }
 
@@ -368,6 +376,70 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
             : 'Tous les bagages éligibles sont déjà chargés.',
     };
     return reply.send(result);
+  });
+
+  // ── POST /scan/soute ─── Identifier le compartiment soute ───
+  app.post<{ Body: SouteBody }>('/scan/soute', async (request, reply) => {
+    const { tag, flightId, soute, scannedBy } = request.body;
+    if (!tag || !flightId || !soute) {
+      return reply.code(400).send({ status: 'rejected', message: 'tag, flightId et soute sont requis' } satisfies BaggageActionResult);
+    }
+    if (soute !== 'avant' && soute !== 'arriere') {
+      return reply.code(400).send({ status: 'rejected', message: 'soute doit être "avant" ou "arriere"' } satisfies BaggageActionResult);
+    }
+
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return reply.code(400).send({ status: 'rejected', message: (e as Error).message } satisfies BaggageActionResult);
+    }
+
+    const supabase = getSupabase();
+
+    const { data: bagRow } = await supabase
+      .from('baggage')
+      .select('id, passenger_id, is_confirmed')
+      .eq('flight_id', flightId)
+      .eq('serial_number', parsedTag.serialNumber)
+      .order('is_confirmed', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!bagRow) {
+      return reply.send({ status: 'rejected', message: 'Bagage inconnu sur ce vol.' } satisfies BaggageActionResult);
+    }
+    if (!bagRow.is_confirmed) {
+      return reply.send({ status: 'rejected', message: 'Bagage non enregistré au tapis — confirmez-le d\'abord.' } satisfies BaggageActionResult);
+    }
+
+    const stamp = new Date().toISOString();
+    await supabase
+      .from('baggage')
+      .update({ soute, soute_at: stamp, soute_by: scannedBy ?? null, tag_number: tag })
+      .eq('id', bagRow.id);
+
+    const { data: pax } = await supabase
+      .from('passengers')
+      .select('full_name, declared_baggage_count')
+      .eq('id', bagRow.passenger_id)
+      .single();
+
+    const { count } = await supabase
+      .from('baggage')
+      .select('id', { count: 'exact', head: true })
+      .eq('passenger_id', bagRow.passenger_id)
+      .eq('soute', soute);
+
+    const souteLabel = soute === 'avant' ? 'soute avant' : 'soute arrière';
+    return reply.send({
+      status: 'accepted',
+      passengerName: pax?.full_name ?? '—',
+      tagNumber: tag,
+      count: count ?? 0,
+      declaredCount: pax?.declared_baggage_count ?? 0,
+      message: `Bagage placé en ${souteLabel}.`,
+    } satisfies BaggageActionResult);
   });
 
   // ── POST /scan/embarquement ─────────────────────────────────
