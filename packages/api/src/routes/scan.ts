@@ -227,7 +227,16 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     }
 
     if (decision.fraudAlert) {
-      await supabase.from('fraud_alerts').insert(decision.fraudAlert);
+      // Une seule alerte par (tag_number, flight_id) — pas de doublon si l'agent re-scanne
+      const { data: existingAlert } = await supabase
+        .from('fraud_alerts')
+        .select('id')
+        .eq('tag_number', decision.fraudAlert.tag_number)
+        .eq('flight_id', decision.fraudAlert.flight_id)
+        .maybeSingle();
+      if (!existingAlert) {
+        await supabase.from('fraud_alerts').insert(decision.fraudAlert);
+      }
     }
 
     return reply.send(decision.result);
