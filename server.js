@@ -320,7 +320,10 @@ async function scanRoutes(app2) {
       await supabase.from("baggage").update({ is_confirmed: true, tag_number: tag, scanned_by: scannedBy ?? null, scanned_at: (/* @__PURE__ */ new Date()).toISOString() }).eq("id", decision.confirmBagId);
     }
     if (decision.fraudAlert) {
-      await supabase.from("fraud_alerts").insert(decision.fraudAlert);
+      const { data: existingAlert } = await supabase.from("fraud_alerts").select("id").eq("tag_number", decision.fraudAlert.tag_number).eq("flight_id", decision.fraudAlert.flight_id).maybeSingle();
+      if (!existingAlert) {
+        await supabase.from("fraud_alerts").insert(decision.fraudAlert);
+      }
     }
     return reply.send(decision.result);
   });
@@ -392,6 +395,42 @@ async function scanRoutes(app2) {
       message: toLoad.length > 0 ? `${toLoad.length} bagage(s) charg\xE9(s) en soute.` : confirmed === 0 ? "Aucun bagage enregistr\xE9 \xE0 charger." : "Tous les bagages \xE9ligibles sont d\xE9j\xE0 charg\xE9s."
     };
     return reply.send(result);
+  });
+  app2.post("/scan/soute", async (request, reply) => {
+    const { tag, flightId, soute, scannedBy } = request.body;
+    if (!tag || !flightId || !soute) {
+      return reply.code(400).send({ status: "rejected", message: "tag, flightId et soute sont requis" });
+    }
+    if (soute !== "avant" && soute !== "arriere") {
+      return reply.code(400).send({ status: "rejected", message: 'soute doit \xEAtre "avant" ou "arriere"' });
+    }
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return reply.code(400).send({ status: "rejected", message: e.message });
+    }
+    const supabase = getSupabase();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    if (!bagRow) {
+      return reply.send({ status: "rejected", message: "Bagage inconnu sur ce vol." });
+    }
+    if (!bagRow.is_confirmed) {
+      return reply.send({ status: "rejected", message: "Bagage non enregistr\xE9 au tapis \u2014 confirmez-le d'abord." });
+    }
+    const stamp = (/* @__PURE__ */ new Date()).toISOString();
+    await supabase.from("baggage").update({ soute, soute_at: stamp, soute_by: scannedBy ?? null, tag_number: tag }).eq("id", bagRow.id);
+    const { data: pax } = await supabase.from("passengers").select("full_name, declared_baggage_count").eq("id", bagRow.passenger_id).single();
+    const { count } = await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", bagRow.passenger_id).eq("soute", soute);
+    const souteLabel = soute === "avant" ? "soute avant" : "soute arri\xE8re";
+    return reply.send({
+      status: "accepted",
+      passengerName: pax?.full_name ?? "\u2014",
+      tagNumber: tag,
+      count: count ?? 0,
+      declaredCount: pax?.declared_baggage_count ?? 0,
+      message: `Bagage plac\xE9 en ${souteLabel}.`
+    });
   });
   app2.post("/scan/embarquement", async (request, reply) => {
     const { raw, flightId, scannedBy } = request.body;
