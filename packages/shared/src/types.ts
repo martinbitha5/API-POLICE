@@ -272,6 +272,34 @@ export interface BaggageLoadAllRejected {
 export type BaggageLoadAllResult = BaggageLoadAllAccepted | BaggageLoadAllRejected;
 
 // ─────────────────────────────────────────────────────────────
+// Dolly : contrôle rayon X avant chargement
+// Seuls les bagages enregistrés (is_confirmed) sont admis sur le dolly.
+// Le dolly « attend » le nombre exact de bagages enregistrés du vol.
+// ─────────────────────────────────────────────────────────────
+
+export interface DollyScanAccepted {
+  status: 'accepted';
+  passengerName: string;
+  tagNumber: string;
+  /** Bagages actuellement sur le dolly pour ce vol. */
+  onDolly: number;
+  /** Cible : total des bagages enregistrés (confirmés) du vol. */
+  confirmed: number;
+  /** true = ce bagage était déjà sur le dolly (re-scan). */
+  alreadyOnDolly: boolean;
+  /** true = tous les bagages enregistrés sont sur le dolly (onDolly ≥ confirmed). */
+  complete: boolean;
+  message: string;
+}
+
+export interface DollyScanRejected {
+  status: 'rejected';
+  message: string;
+}
+
+export type DollyScanResult = DollyScanAccepted | DollyScanRejected;
+
+// ─────────────────────────────────────────────────────────────
 // Embarquement à la porte (boarding pass scanné au gate)
 // ─────────────────────────────────────────────────────────────
 

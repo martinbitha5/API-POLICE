@@ -476,6 +476,64 @@ async function scanRoutes(app2) {
       message: `Bagage plac\xE9 en ${souteLabel}.`
     });
   });
+  app2.post("/scan/dolly", async (request, reply) => {
+    const { tag, flightId } = request.body;
+    const scannedBy = request.authUserId;
+    if (!tag || !flightId) {
+      return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
+    }
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return reply.code(400).send({ status: "rejected", message: e.message });
+    }
+    const supabase = getSupabase();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, on_dolly").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    async function progress() {
+      const [{ count: onDolly2 }, { count: confirmed2 }] = await Promise.all([
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("on_dolly", true),
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("is_confirmed", true)
+      ]);
+      return { onDolly: onDolly2 ?? 0, confirmed: confirmed2 ?? 0 };
+    }
+    if (!bagRow) {
+      return reply.send({ status: "rejected", message: "Bagage inconnu sur ce vol \u2014 ne pas charger." });
+    }
+    if (!bagRow.is_confirmed) {
+      return reply.send({
+        status: "rejected",
+        message: "Bagage non enregistr\xE9 au tapis \u2014 ne pas charger."
+      });
+    }
+    const { data: pax } = await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single();
+    if (bagRow.on_dolly) {
+      const { onDolly: onDolly2, confirmed: confirmed2 } = await progress();
+      return reply.send({
+        status: "accepted",
+        passengerName: pax?.full_name ?? "\u2014",
+        tagNumber: tag,
+        onDolly: onDolly2,
+        confirmed: confirmed2,
+        alreadyOnDolly: true,
+        complete: onDolly2 >= confirmed2 && confirmed2 > 0,
+        message: "D\xE9j\xE0 sur le dolly."
+      });
+    }
+    await supabase.from("baggage").update({ on_dolly: true, on_dolly_at: (/* @__PURE__ */ new Date()).toISOString(), on_dolly_by: scannedBy, tag_number: tag }).eq("id", bagRow.id);
+    const { onDolly, confirmed } = await progress();
+    const complete = onDolly >= confirmed && confirmed > 0;
+    return reply.send({
+      status: "accepted",
+      passengerName: pax?.full_name ?? "\u2014",
+      tagNumber: tag,
+      onDolly,
+      confirmed,
+      alreadyOnDolly: false,
+      complete,
+      message: complete ? "Dolly complet \u2014 tous les bagages enregistr\xE9s sont charg\xE9s." : "Bagage s\xFBr \u2014 plac\xE9 sur le dolly."
+    });
+  });
   app2.post("/scan/embarquement", async (request, reply) => {
     const { raw, flightId } = request.body;
     const scannedBy = request.authUserId;

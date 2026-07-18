@@ -5,6 +5,7 @@ import {
   type BoardingGateResult,
   type BaggageActionResult,
   type BaggageLoadAllResult,
+  type DollyScanResult,
   type SoutePosition,
 } from '@police/shared';
 import { getSupabase } from '../supabase.js';
@@ -455,6 +456,98 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       declaredCount: pax?.declared_baggage_count ?? 0,
       message: `Bagage placé en ${souteLabel}.`,
     } satisfies BaggageActionResult);
+  });
+
+  // ── POST /scan/dolly ─── Contrôle rayon X → dolly de chargement ─
+  // L'agent scanne chaque bagage sortant du rayon X. Seuls les bagages DÉJÀ
+  // enregistrés au tapis (is_confirmed, liés à un passager) sont admis sur le
+  // dolly et tractés vers l'avion. Tout bagage non enregistré est refusé — on
+  // ne charge que du bagage sûr. Renvoie la progression onDolly / confirmés.
+  app.post<{ Body: BaggageActionBody }>('/scan/dolly', async (request, reply) => {
+    const { tag, flightId } = request.body;
+    const scannedBy = request.authUserId;
+    if (!tag || !flightId) {
+      return reply.code(400).send({ status: 'rejected', message: 'tag et flightId sont requis' } satisfies DollyScanResult);
+    }
+
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return reply.code(400).send({ status: 'rejected', message: (e as Error).message } satisfies DollyScanResult);
+    }
+
+    const supabase = getSupabase();
+
+    // Bagage de ce vol par n° de série (clé de liaison) ; on privilégie la ligne confirmée.
+    const { data: bagRow } = await supabase
+      .from('baggage')
+      .select('id, passenger_id, is_confirmed, on_dolly')
+      .eq('flight_id', flightId)
+      .eq('serial_number', parsedTag.serialNumber)
+      .order('is_confirmed', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    // Compteurs du vol : cible = bagages enregistrés (confirmés).
+    async function progress(): Promise<{ onDolly: number; confirmed: number }> {
+      const [{ count: onDolly }, { count: confirmed }] = await Promise.all([
+        supabase.from('baggage').select('id', { count: 'exact', head: true }).eq('flight_id', flightId).eq('on_dolly', true),
+        supabase.from('baggage').select('id', { count: 'exact', head: true }).eq('flight_id', flightId).eq('is_confirmed', true),
+      ]);
+      return { onDolly: onDolly ?? 0, confirmed: confirmed ?? 0 };
+    }
+
+    // Règle Dolly : refuser tout bagage non enregistré au tapis.
+    if (!bagRow) {
+      return reply.send({ status: 'rejected', message: 'Bagage inconnu sur ce vol — ne pas charger.' } satisfies DollyScanResult);
+    }
+    if (!bagRow.is_confirmed) {
+      return reply.send({
+        status: 'rejected',
+        message: 'Bagage non enregistré au tapis — ne pas charger.',
+      } satisfies DollyScanResult);
+    }
+
+    // Contexte passager pour l'affichage.
+    const { data: pax } = await supabase
+      .from('passengers')
+      .select('full_name')
+      .eq('id', bagRow.passenger_id)
+      .single();
+
+    // Déjà sur le dolly → re-scan, pas de nouvelle écriture.
+    if (bagRow.on_dolly) {
+      const { onDolly, confirmed } = await progress();
+      return reply.send({
+        status: 'accepted',
+        passengerName: pax?.full_name ?? '—',
+        tagNumber: tag,
+        onDolly,
+        confirmed,
+        alreadyOnDolly: true,
+        complete: onDolly >= confirmed && confirmed > 0,
+        message: 'Déjà sur le dolly.',
+      } satisfies DollyScanResult);
+    }
+
+    await supabase
+      .from('baggage')
+      .update({ on_dolly: true, on_dolly_at: new Date().toISOString(), on_dolly_by: scannedBy, tag_number: tag })
+      .eq('id', bagRow.id);
+
+    const { onDolly, confirmed } = await progress();
+    const complete = onDolly >= confirmed && confirmed > 0;
+    return reply.send({
+      status: 'accepted',
+      passengerName: pax?.full_name ?? '—',
+      tagNumber: tag,
+      onDolly,
+      confirmed,
+      alreadyOnDolly: false,
+      complete,
+      message: complete ? 'Dolly complet — tous les bagages enregistrés sont chargés.' : 'Bagage sûr — placé sur le dolly.',
+    } satisfies DollyScanResult);
   });
 
   // ── POST /scan/embarquement ─────────────────────────────────
