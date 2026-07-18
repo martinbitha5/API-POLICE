@@ -196,14 +196,55 @@ function evaluateBaggageScan(ctx) {
   };
 }
 
+// packages/api/src/auth.ts
+var ALLOWED_ROLES = ["agent", "supervisor", "admin"];
+function bearerToken(request) {
+  const header = request.headers.authorization;
+  if (!header) return null;
+  const [scheme, token] = header.split(" ");
+  if (scheme?.toLowerCase() !== "bearer" || !token) return null;
+  return token.trim();
+}
+async function authenticate(request, reply) {
+  const token = bearerToken(request);
+  if (!token) {
+    await reply.code(401).send({ error: "Authentification requise" });
+    return;
+  }
+  const supabase = getSupabase();
+  const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+  if (userErr || !userData.user) {
+    await reply.code(401).send({ error: "Session invalide ou expir\xE9e" });
+    return;
+  }
+  const { data: profile, error: profErr } = await supabase.from("profiles").select("role").eq("id", userData.user.id).single();
+  if (profErr || !profile) {
+    await reply.code(403).send({ error: "Profil introuvable" });
+    return;
+  }
+  if (!ALLOWED_ROLES.includes(profile.role)) {
+    await reply.code(403).send({ error: "R\xF4le non autoris\xE9" });
+    return;
+  }
+  request.authUserId = userData.user.id;
+  request.authRole = profile.role;
+}
+
 // packages/api/src/routes/scan.ts
 async function scanRoutes(app2) {
+  app2.addHook("preHandler", authenticate);
   app2.post("/scan/boarding", async (request, reply) => {
-    const { raw, flightId, scannedBy } = request.body;
+    const { raw, flightId } = request.body;
+    const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: "raw et flightId sont requis" });
     }
-    const parsed = parseBoardingPass(raw);
+    let parsed;
+    try {
+      parsed = parseBoardingPass(raw);
+    } catch {
+      return reply.code(400).send({ error: "\u26A0\uFE0F Boarding pass illisible \u2014 rescannez." });
+    }
     const supabase = getSupabase();
     const { data: flight, error: flightErr } = await supabase.from("flights").select("flight_number").eq("id", flightId).single();
     if (flightErr || !flight) {
@@ -278,7 +319,8 @@ async function scanRoutes(app2) {
     });
   });
   app2.post("/scan/baggage", async (request, reply) => {
-    const { tag, flightId, gate, scannedBy } = request.body;
+    const { tag, flightId, gate } = request.body;
+    const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ error: "tag et flightId sont requis" });
     }
@@ -327,8 +369,8 @@ async function scanRoutes(app2) {
     }
     return reply.send(decision.result);
   });
-  async function markBaggage(field, body) {
-    const { tag, flightId, scannedBy } = body;
+  async function markBaggage(field, body, scannedBy) {
+    const { tag, flightId } = body;
     if (!tag || !flightId) {
       return { code: 400, result: { status: "rejected", message: "tag et flightId sont requis" } };
     }
@@ -368,11 +410,12 @@ async function scanRoutes(app2) {
     };
   }
   app2.post("/scan/rush", async (request, reply) => {
-    const { code, result } = await markBaggage("rush", request.body);
+    const { code, result } = await markBaggage("rush", request.body, request.authUserId);
     return reply.code(code).send(result);
   });
   app2.post("/scan/load-all", async (request, reply) => {
-    const { flightId, scannedBy } = request.body;
+    const { flightId } = request.body;
+    const scannedBy = request.authUserId;
     if (!flightId) {
       return reply.code(400).send({ status: "rejected", message: "flightId est requis" });
     }
@@ -397,7 +440,8 @@ async function scanRoutes(app2) {
     return reply.send(result);
   });
   app2.post("/scan/soute", async (request, reply) => {
-    const { tag, flightId, soute, scannedBy } = request.body;
+    const { tag, flightId, soute } = request.body;
+    const scannedBy = request.authUserId;
     if (!tag || !flightId || !soute) {
       return reply.code(400).send({ status: "rejected", message: "tag, flightId et soute sont requis" });
     }
@@ -433,11 +477,17 @@ async function scanRoutes(app2) {
     });
   });
   app2.post("/scan/embarquement", async (request, reply) => {
-    const { raw, flightId, scannedBy } = request.body;
+    const { raw, flightId } = request.body;
+    const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: "raw et flightId sont requis" });
     }
-    const parsed = parseBoardingPass(raw);
+    let parsed;
+    try {
+      parsed = parseBoardingPass(raw);
+    } catch {
+      return reply.code(400).send({ error: "\u26A0\uFE0F Boarding pass illisible \u2014 rescannez." });
+    }
     const supabase = getSupabase();
     const { data: flight, error: flightErr } = await supabase.from("flights").select("flight_number").eq("id", flightId).single();
     if (flightErr || !flight) {

@@ -9,6 +9,7 @@ import {
 } from '@police/shared';
 import { getSupabase } from '../supabase.js';
 import { evaluateBaggageScan, type BaggageScanContext } from '../fraud.js';
+import { authenticate } from '../auth.js';
 
 interface BoardingBody {
   raw: string;
@@ -43,14 +44,24 @@ interface SouteBody {
 }
 
 export async function scanRoutes(app: FastifyInstance): Promise<void> {
+  // Toutes les routes de scan exigent un agent/superviseur/admin authentifié.
+  // L'identité du scanneur est dérivée du JWT (request.authUserId), jamais du body.
+  app.addHook('preHandler', authenticate);
+
   // ── POST /scan/boarding ─────────────────────────────────────
   app.post<{ Body: BoardingBody }>('/scan/boarding', async (request, reply) => {
-    const { raw, flightId, scannedBy } = request.body;
+    const { raw, flightId } = request.body;
+    const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: 'raw et flightId sont requis' });
     }
 
-    const parsed = parseBoardingPass(raw);
+    let parsed;
+    try {
+      parsed = parseBoardingPass(raw);
+    } catch {
+      return reply.code(400).send({ error: '⚠️ Boarding pass illisible — rescannez.' });
+    }
     const supabase = getSupabase();
 
     // Le boarding pass doit appartenir au vol sélectionné. On compare le n° de vol
@@ -155,7 +166,8 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
   // ── POST /scan/baggage ──────────────────────────────────────
   app.post<{ Body: BaggageBody }>('/scan/baggage', async (request, reply) => {
-    const { tag, flightId, gate, scannedBy } = request.body;
+    const { tag, flightId, gate } = request.body;
+    const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ error: 'tag et flightId sont requis' });
     }
@@ -257,8 +269,9 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
   async function markBaggage(
     field: 'in_hold' | 'rush',
     body: BaggageActionBody,
+    scannedBy: string,
   ): Promise<{ code: number; result: BaggageActionResult }> {
-    const { tag, flightId, scannedBy } = body;
+    const { tag, flightId } = body;
     if (!tag || !flightId) {
       return { code: 400, result: { status: 'rejected', message: 'tag et flightId sont requis' } };
     }
@@ -327,7 +340,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
   // ── POST /scan/rush ─── Marquer un bagage pour réacheminement ─
   app.post<{ Body: BaggageActionBody }>('/scan/rush', async (request, reply) => {
-    const { code, result } = await markBaggage('rush', request.body);
+    const { code, result } = await markBaggage('rush', request.body, request.authUserId);
     return reply.code(code).send(result);
   });
 
@@ -336,7 +349,8 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
   // rush. Le flux : on scanne d'abord les bagages rush (restants), puis on
   // charge le reste d'un coup avec cette action.
   app.post<{ Body: { flightId: string; scannedBy?: string } }>('/scan/load-all', async (request, reply) => {
-    const { flightId, scannedBy } = request.body;
+    const { flightId } = request.body;
+    const scannedBy = request.authUserId;
     if (!flightId) {
       return reply.code(400).send({ status: 'rejected', message: 'flightId est requis' } satisfies BaggageLoadAllResult);
     }
@@ -380,7 +394,8 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
   // ── POST /scan/soute ─── Identifier le compartiment soute ───
   app.post<{ Body: SouteBody }>('/scan/soute', async (request, reply) => {
-    const { tag, flightId, soute, scannedBy } = request.body;
+    const { tag, flightId, soute } = request.body;
+    const scannedBy = request.authUserId;
     if (!tag || !flightId || !soute) {
       return reply.code(400).send({ status: 'rejected', message: 'tag, flightId et soute sont requis' } satisfies BaggageActionResult);
     }
@@ -448,12 +463,18 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
   // renvoie le compteur "reste à embarquer". Un boarding pass d'un passager
   // non enregistré est refusé (le check-in doit précéder l'embarquement).
   app.post<{ Body: EmbarquementBody }>('/scan/embarquement', async (request, reply) => {
-    const { raw, flightId, scannedBy } = request.body;
+    const { raw, flightId } = request.body;
+    const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: 'raw et flightId sont requis' });
     }
 
-    const parsed = parseBoardingPass(raw);
+    let parsed;
+    try {
+      parsed = parseBoardingPass(raw);
+    } catch {
+      return reply.code(400).send({ error: '⚠️ Boarding pass illisible — rescannez.' });
+    }
     const supabase = getSupabase();
 
     const { data: flight, error: flightErr } = await supabase
