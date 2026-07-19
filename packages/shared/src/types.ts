@@ -159,6 +159,10 @@ export interface Baggage {
   in_hold: boolean;
   in_hold_at: string | null;
   in_hold_by: string | null;
+  /** true = bagage contrôlé au rayon X et placé sur le dolly (avant chargement). */
+  on_dolly: boolean;
+  on_dolly_at: string | null;
+  on_dolly_by: string | null;
   /** true = bagage restant marqué pour réacheminement sur le prochain vol. */
   rush: boolean;
   rush_at: string | null;
