@@ -110,6 +110,8 @@ export interface Flight {
   destination: string;
   /** Escales intermédiaires en ordre de trajet (vols avec transit). Route complète = origin → stops → destination. */
   stops: string[] | null;
+  /** Transporteur, dérivé du préfixe de flight_number. Colonne générée : sert au cloisonnement par compagnie. */
+  airline_code: string | null;
   departure_time: string | null;
   arrival_time: string | null;
   status: FlightStatus;
