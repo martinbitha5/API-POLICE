@@ -171,6 +171,10 @@ export interface Baggage {
   soute: SoutePosition | null;
   soute_at: string | null;
   soute_by: string | null;
+  /** true = bagage scanné à l'arrivée par l'escale de destination. */
+  arrived: boolean;
+  arrived_at: string | null;
+  arrived_by: string | null;
   scanned_at: string;
   scanned_by: string | null;
 }
@@ -306,6 +310,34 @@ export interface DollyScanRejected {
 export type DollyScanResult = DollyScanAccepted | DollyScanRejected;
 
 // ─────────────────────────────────────────────────────────────
+// Arrivée : réception des bagages à l'escale de destination
+// La cible est le nombre de bagages réellement partis en soute (hors rush) :
+// 100 chargés au départ = 100 à scanner à l'arrivée. L'écart = manquants.
+// ─────────────────────────────────────────────────────────────
+
+export interface ArrivalScanAccepted {
+  status: 'accepted';
+  passengerName: string;
+  tagNumber: string;
+  /** Bagages déjà scannés à l'arrivée pour ce vol. */
+  arrived: number;
+  /** Cible : bagages partis en soute sur ce vol (in_hold, hors rush). */
+  expected: number;
+  /** true = ce bagage était déjà scanné à l'arrivée (re-scan). */
+  alreadyArrived: boolean;
+  /** true = tous les bagages partis sont arrivés (arrived ≥ expected). */
+  complete: boolean;
+  message: string;
+}
+
+export interface ArrivalScanRejected {
+  status: 'rejected';
+  message: string;
+}
+
+export type ArrivalScanResult = ArrivalScanAccepted | ArrivalScanRejected;
+
+// ─────────────────────────────────────────────────────────────
 // Embarquement à la porte (boarding pass scanné au gate)
 // ─────────────────────────────────────────────────────────────
 
@@ -342,16 +374,18 @@ export type BoardingGateResult = BoardingGateAccepted | BoardingGateRejected;
 /**
  * État d'un bagage du point de vue passager (du plus avancé au moins avancé) :
  *  • rush       : restant, marqué pour réacheminement sur le prochain vol.
- *  • loaded     : chargé en soute pour la destination.
+ *  • arrived    : scanné à l'arrivée par l'escale de destination.
+ *  • in_transit : chargé en soute, part avec l'appareil.
  *  • registered : étiquette scannée au tapis (enregistré, anti-fraude OK).
  *  • pending    : déclaré mais pas encore scanné.
  */
-export type BaggageStatus = 'pending' | 'registered' | 'loaded' | 'rush';
+export type BaggageStatus = 'pending' | 'registered' | 'in_transit' | 'arrived' | 'rush';
 
 export const BAGGAGE_STATUS_LABEL: Record<BaggageStatus, string> = {
   pending: 'En attente',
   registered: 'Enregistré',
-  loaded: 'Chargé en soute',
+  in_transit: 'En route',
+  arrived: 'Arrivé à destination',
   rush: 'Réacheminement',
 } as const;
 

@@ -6,6 +6,7 @@ import {
   type BaggageActionResult,
   type BaggageLoadAllResult,
   type DollyScanResult,
+  type ArrivalScanResult,
   type SoutePosition,
 } from '@police/shared';
 import { getSupabase } from '../supabase.js';
@@ -548,6 +549,112 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       complete,
       message: complete ? 'Dolly complet — tous les bagages enregistrés sont chargés.' : 'Bagage sûr — placé sur le dolly.',
     } satisfies DollyScanResult);
+  });
+
+  // ── POST /scan/arrivee ─── Réception à l'escale de destination ─
+  // Dernière étape du parcours bagage. L'agent de l'aéroport d'arrivée scanne
+  // chaque bagage sorti de la soute pour confirmer sa réception. La cible est
+  // le nombre de bagages réellement partis (in_hold, hors rush) : 100 chargés
+  // au départ = 100 à scanner à l'arrivée, et l'écart désigne les manquants.
+  //
+  // On n'accepte que des bagages effectivement chargés sur CE vol : un bagage
+  // inconnu, resté au départ (rush) ou jamais chargé est refusé, sinon le
+  // compteur d'arrivée ne voudrait plus rien dire.
+  app.post<{ Body: BaggageActionBody }>('/scan/arrivee', async (request, reply) => {
+    const { tag, flightId } = request.body;
+    const scannedBy = request.authUserId;
+    if (!tag || !flightId) {
+      return reply.code(400).send({ status: 'rejected', message: 'tag et flightId sont requis' } satisfies ArrivalScanResult);
+    }
+
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return reply.code(400).send({ status: 'rejected', message: (e as Error).message } satisfies ArrivalScanResult);
+    }
+
+    const supabase = getSupabase();
+
+    const { data: bagRow } = await supabase
+      .from('baggage')
+      .select('id, passenger_id, is_confirmed, in_hold, rush, arrived')
+      .eq('flight_id', flightId)
+      .eq('serial_number', parsedTag.serialNumber)
+      .order('is_confirmed', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    // Compteurs du vol : arrivés / partis en soute (hors rush).
+    async function progress(): Promise<{ arrived: number; expected: number }> {
+      const [{ count: arrived }, { count: expected }] = await Promise.all([
+        supabase.from('baggage').select('id', { count: 'exact', head: true }).eq('flight_id', flightId).eq('arrived', true),
+        supabase
+          .from('baggage')
+          .select('id', { count: 'exact', head: true })
+          .eq('flight_id', flightId)
+          .eq('in_hold', true)
+          .eq('rush', false),
+      ]);
+      return { arrived: arrived ?? 0, expected: expected ?? 0 };
+    }
+
+    if (!bagRow) {
+      return reply.send({ status: 'rejected', message: 'Bagage inconnu sur ce vol.' } satisfies ArrivalScanResult);
+    }
+    if (bagRow.rush) {
+      return reply.send({
+        status: 'rejected',
+        message: 'Bagage marqué rush, resté au départ. Il arrivera sur un autre vol.',
+      } satisfies ArrivalScanResult);
+    }
+    if (!bagRow.in_hold) {
+      return reply.send({
+        status: 'rejected',
+        message: 'Bagage non chargé sur ce vol, il n’aurait pas dû voyager.',
+      } satisfies ArrivalScanResult);
+    }
+
+    const { data: pax } = await supabase
+      .from('passengers')
+      .select('full_name')
+      .eq('id', bagRow.passenger_id)
+      .single();
+
+    // Déjà scanné à l'arrivée → re-scan, pas de nouvelle écriture.
+    if (bagRow.arrived) {
+      const { arrived, expected } = await progress();
+      return reply.send({
+        status: 'accepted',
+        passengerName: pax?.full_name ?? '—',
+        tagNumber: tag,
+        arrived,
+        expected,
+        alreadyArrived: true,
+        complete: arrived >= expected && expected > 0,
+        message: 'Bagage déjà réceptionné.',
+      } satisfies ArrivalScanResult);
+    }
+
+    await supabase
+      .from('baggage')
+      .update({ arrived: true, arrived_at: new Date().toISOString(), arrived_by: scannedBy, tag_number: tag })
+      .eq('id', bagRow.id);
+
+    const { arrived, expected } = await progress();
+    const complete = arrived >= expected && expected > 0;
+    return reply.send({
+      status: 'accepted',
+      passengerName: pax?.full_name ?? '—',
+      tagNumber: tag,
+      arrived,
+      expected,
+      alreadyArrived: false,
+      complete,
+      message: complete
+        ? 'Réception complète, tous les bagages chargés sont arrivés.'
+        : 'Bagage réceptionné à destination.',
+    } satisfies ArrivalScanResult);
   });
 
   // ── POST /scan/embarquement ─────────────────────────────────

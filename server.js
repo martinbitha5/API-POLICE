@@ -534,6 +534,70 @@ async function scanRoutes(app2) {
       message: complete ? "Dolly complet \u2014 tous les bagages enregistr\xE9s sont charg\xE9s." : "Bagage s\xFBr \u2014 plac\xE9 sur le dolly."
     });
   });
+  app2.post("/scan/arrivee", async (request, reply) => {
+    const { tag, flightId } = request.body;
+    const scannedBy = request.authUserId;
+    if (!tag || !flightId) {
+      return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
+    }
+    let parsedTag;
+    try {
+      parsedTag = parseBaggageTag(tag);
+    } catch (e) {
+      return reply.code(400).send({ status: "rejected", message: e.message });
+    }
+    const supabase = getSupabase();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, in_hold, rush, arrived").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    async function progress() {
+      const [{ count: arrived2 }, { count: expected2 }] = await Promise.all([
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("arrived", true),
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("in_hold", true).eq("rush", false)
+      ]);
+      return { arrived: arrived2 ?? 0, expected: expected2 ?? 0 };
+    }
+    if (!bagRow) {
+      return reply.send({ status: "rejected", message: "Bagage inconnu sur ce vol." });
+    }
+    if (bagRow.rush) {
+      return reply.send({
+        status: "rejected",
+        message: "Bagage marqu\xE9 rush, rest\xE9 au d\xE9part. Il arrivera sur un autre vol."
+      });
+    }
+    if (!bagRow.in_hold) {
+      return reply.send({
+        status: "rejected",
+        message: "Bagage non charg\xE9 sur ce vol, il n\u2019aurait pas d\xFB voyager."
+      });
+    }
+    const { data: pax } = await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single();
+    if (bagRow.arrived) {
+      const { arrived: arrived2, expected: expected2 } = await progress();
+      return reply.send({
+        status: "accepted",
+        passengerName: pax?.full_name ?? "\u2014",
+        tagNumber: tag,
+        arrived: arrived2,
+        expected: expected2,
+        alreadyArrived: true,
+        complete: arrived2 >= expected2 && expected2 > 0,
+        message: "Bagage d\xE9j\xE0 r\xE9ceptionn\xE9."
+      });
+    }
+    await supabase.from("baggage").update({ arrived: true, arrived_at: (/* @__PURE__ */ new Date()).toISOString(), arrived_by: scannedBy, tag_number: tag }).eq("id", bagRow.id);
+    const { arrived, expected } = await progress();
+    const complete = arrived >= expected && expected > 0;
+    return reply.send({
+      status: "accepted",
+      passengerName: pax?.full_name ?? "\u2014",
+      tagNumber: tag,
+      arrived,
+      expected,
+      alreadyArrived: false,
+      complete,
+      message: complete ? "R\xE9ception compl\xE8te, tous les bagages charg\xE9s sont arriv\xE9s." : "Bagage r\xE9ceptionn\xE9 \xE0 destination."
+    });
+  });
   app2.post("/scan/embarquement", async (request, reply) => {
     const { raw, flightId } = request.body;
     const scannedBy = request.authUserId;
