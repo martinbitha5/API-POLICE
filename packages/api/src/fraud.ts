@@ -100,23 +100,30 @@ export function evaluateBaggageScan(ctx: BaggageScanContext): BaggageScanDecisio
 
   // Règle 4 — étiquette déjà scannée (doublon). Pas d'alerte fraude.
   if (ctx.duplicateConfirmedTag) {
-    return reject(FRAUD_REASON.ALREADY_SCANNED, '⚠️ Bagage déjà enregistré');
+    return reject(FRAUD_REASON.ALREADY_SCANNED, 'Ce bagage a déjà été enregistré. Passez au suivant.');
   }
 
   // Règle 1 — ce n° de série n'est déclaré sur aucun boarding pass. On ne peut
   // nommer personne : l'étiquette est orpheline, c'est tout ce qu'on sait.
   if (!registeredBag || !passenger) {
-    return rejectWithAlert(ctx, FRAUD_REASON.UNLINKED_TAG, 'Bagage non autorisé — superviseur alerté');
+    return rejectWithAlert(
+      ctx,
+      FRAUD_REASON.UNLINKED_TAG,
+      "Bagage refusé. Aucun passager n'a déclaré cette étiquette. Mettez le bagage de côté, le superviseur arrive.",
+    );
   }
 
   // Règle 5 — bagage rattaché à un autre vol. Pas d'alerte fraude.
   if (passenger.flightId !== ctx.flightId) {
-    return reject(FRAUD_REASON.WRONG_FLIGHT, 'Bagage appartient à un autre vol');
+    return reject(
+      FRAUD_REASON.WRONG_FLIGHT,
+      "Ce bagage n'est pas sur le bon tapis. Il appartient à un autre vol.",
+    );
   }
 
   // Étiquette physique re-scannée sur une ligne déjà confirmée.
   if (registeredBag.isConfirmed) {
-    return reject(FRAUD_REASON.ALREADY_SCANNED, '⚠️ Bagage déjà enregistré');
+    return reject(FRAUD_REASON.ALREADY_SCANNED, 'Ce bagage a déjà été enregistré. Passez au suivant.');
   }
 
   // Règle 2 — 0 bagage déclaré sur le boarding pass.
@@ -124,7 +131,7 @@ export function evaluateBaggageScan(ctx: BaggageScanContext): BaggageScanDecisio
     return rejectWithAlert(
       ctx,
       FRAUD_REASON.ZERO_DECLARED,
-      'Bagage non autorisé — superviseur alerté',
+      `Bagage refusé. ${passenger.fullName} voyage sans bagage en soute. Mettez le bagage de côté, le superviseur arrive.`,
     );
   }
 
@@ -133,7 +140,7 @@ export function evaluateBaggageScan(ctx: BaggageScanContext): BaggageScanDecisio
     return rejectWithAlert(
       ctx,
       FRAUD_REASON.QUOTA_EXCEEDED,
-      'Bagage non autorisé — quota dépassé, superviseur alerté',
+      `Bagage refusé. ${passenger.fullName} a déjà ses ${passenger.declaredBaggageCount} bagage${passenger.declaredBaggageCount > 1 ? 's' : ''}. Mettez celui-ci de côté, le superviseur arrive.`,
     );
   }
 

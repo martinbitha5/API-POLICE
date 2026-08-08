@@ -97,17 +97,21 @@ async function findTagOnOtherFlights(
 
   const bag = row as (LinkedBagRow & { flight_id: string }) | null;
   if (!bag) return null;
-  return { bag, flightNumber: others.find((f) => f.id === bag.flight_id)?.flight_number ?? '—' };
+  return { bag, flightNumber: others.find((f) => f.id === bag.flight_id)?.flight_number ?? 'inconnu' };
 }
 
 /**
  * Étiquette orpheline : aucun boarding pass ne la déclare, donc aucun nom à
- * afficher. On dit alors ce qu'on sait, c'est-à-dire d'où sort la série.
+ * afficher. On dit alors ce qu'on sait, c'est-à-dire d'où sort l'étiquette.
  *
  * Les étiquettes d'un comptoir sont imprimées en série continue pour un vol.
  * Une série qui tombe dans la plage déjà vue sur ce vol désigne un colis
- * étiqueté ici, sur un dossier sans bagage déclaré — le scénario de fraude.
+ * étiqueté ici, sur un dossier sans bagage déclaré : le scénario de fraude.
  * Hors de cette plage, il s'agit plutôt d'un bagage étranger au vol.
+ *
+ * Le texte renvoyé est lu par un superviseur en salle, pas par un développeur :
+ * il dit quoi faire, pas comment le calcul a été fait. Les numéros de série ne
+ * lui servent à rien, l'étiquette est déjà affichée au-dessus.
  *
  * C'est un indice de provenance, pas une identification : on ne devine jamais
  * un propriétaire par proximité de série, attribuer une fraude au mauvais
@@ -143,13 +147,13 @@ async function describeUnlinkedTag(
   const hi = (last as { serial_number: string | null } | null)?.serial_number ?? null;
 
   if (!lo || !hi) {
-    return `Aucune étiquette ${prefix} encore déclarée sur ce vol : impossible de situer la série ${serial}. Vérifier que le check-in a bien été scanné.`;
+    return "Aucun bagage n'est encore enregistré sur ce vol. Vérifier que le comptoir a commencé à scanner les boarding pass.";
   }
   // Séries à 6 chiffres complétées à gauche par des zéros : l'ordre
   // lexicographique est l'ordre numérique.
   return serial >= lo && serial <= hi
-    ? `Série ${serial} dans la plage imprimée pour ce vol (${lo} à ${hi}) : étiquette émise au comptoir sur un dossier sans bagage déclaré. Colis à intercepter.`
-    : `Série ${serial} hors de la plage imprimée pour ce vol (${lo} à ${hi}) : étiquette étrangère à ce vol.`;
+    ? "Étiquette imprimée au comptoir pour ce vol, mais aucun passager ne l'a déclarée. Faire intercepter le colis avant le chargement."
+    : "Cette étiquette ne vient pas du comptoir de ce vol. Bagage probablement égaré, à mettre de côté.";
 }
 
 export async function scanRoutes(app: FastifyInstance): Promise<void> {
@@ -169,7 +173,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     try {
       parsed = parseBoardingPass(raw);
     } catch {
-      return reply.code(400).send({ error: '⚠️ Boarding pass illisible — rescannez.' });
+      return reply.code(400).send({ error: 'Boarding pass illisible. Rescannez le billet.' });
     }
     const supabase = getSupabase();
 
@@ -189,7 +193,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
     if (!flightNumbersMatch(parsed.flightNumber, flight.flight_number)) {
       return reply.code(409).send({
-        error: `⚠️ Boarding pass ${parsed.flightNumber || '—'} — vol ${flight.flight_number}. Mauvais vol.`,
+        error: `Ce billet est pour le vol ${parsed.flightNumber || 'inconnu'}, pas pour ${flight.flight_number}.`,
       });
     }
 
@@ -213,7 +217,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       // 23505 = violation contrainte unique (flight_id, pnr, seat)
       // → ce passager précis (même siège) a déjà été scanné sur ce vol.
       if (error.code === '23505') {
-        return reply.code(409).send({ error: '⚠️ Passager déjà enregistré' });
+        return reply.code(409).send({ error: 'Ce passager est déjà enregistré.' });
       }
       request.log.error(error);
       return reply.code(500).send({ error: "Échec de l'enregistrement du passager" });
@@ -283,7 +287,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
             resolved: true,
             resolved_at: new Date().toISOString(),
             resolved_by: scannedBy ?? null,
-            note: `Résolue automatiquement : check-in de ${parsed.fullName} (PNR ${parsed.pnr}) sur ${flight.flight_number} postérieur au scan du bagage. L'étiquette est déclarée sur son boarding pass.`,
+            note: `Fausse alerte. ${parsed.fullName} (PNR ${parsed.pnr}) s'est enregistré sur ${flight.flight_number} après le passage du bagage. L'étiquette est bien sur son billet, il n'y a pas de fraude. Le bagage peut être repassé au tapis.`,
           })
           .in('flight_id', dayIds)
           .eq('resolved', false)
@@ -354,7 +358,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       const elsewhere = await findTagOnOtherFlights(supabase, flightId, parsedTag);
       linkedBag = elsewhere?.bag ?? null;
       tagNote = elsewhere
-        ? `Étiquette enregistrée sur le vol ${elsewhere.flightNumber}, pas sur celui-ci.`
+        ? `Ce bagage est celui du vol ${elsewhere.flightNumber}. Il s'est trompé de tapis.`
         : await describeUnlinkedTag(supabase, flightId, parsedTag);
     }
 
@@ -458,12 +462,12 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       .maybeSingle();
 
     if (!bagRow) {
-      return { code: 200, result: { status: 'rejected', message: 'Bagage inconnu sur ce vol.' } };
+      return { code: 200, result: { status: 'rejected', message: "Ce bagage n'appartient pas à ce vol." } };
     }
     if (!bagRow.is_confirmed) {
       return {
         code: 200,
-        result: { status: 'rejected', message: 'Bagage non enregistré au tapis — confirmez-le d’abord.' },
+        result: { status: 'rejected', message: "Ce bagage n'est pas encore passé au tapis. Enregistrez-le d'abord." },
       };
     }
 
@@ -584,10 +588,10 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       .maybeSingle();
 
     if (!bagRow) {
-      return reply.send({ status: 'rejected', message: 'Bagage inconnu sur ce vol.' } satisfies BaggageActionResult);
+      return reply.send({ status: 'rejected', message: "Ce bagage n'appartient pas à ce vol." } satisfies BaggageActionResult);
     }
     if (!bagRow.is_confirmed) {
-      return reply.send({ status: 'rejected', message: 'Bagage non enregistré au tapis — confirmez-le d\'abord.' } satisfies BaggageActionResult);
+      return reply.send({ status: 'rejected', message: "Ce bagage n'est pas encore passé au tapis. Enregistrez-le d'abord." } satisfies BaggageActionResult);
     }
 
     const stamp = new Date().toISOString();
@@ -661,12 +665,12 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
     // Règle Dolly : refuser tout bagage non enregistré au tapis.
     if (!bagRow) {
-      return reply.send({ status: 'rejected', message: 'Bagage inconnu sur ce vol — ne pas charger.' } satisfies DollyScanResult);
+      return reply.send({ status: 'rejected', message: "Ce bagage n'appartient pas à ce vol. Ne pas le charger." } satisfies DollyScanResult);
     }
     if (!bagRow.is_confirmed) {
       return reply.send({
         status: 'rejected',
-        message: 'Bagage non enregistré au tapis — ne pas charger.',
+        message: "Ce bagage n'est pas passé au tapis. Ne pas le charger.",
       } satisfies DollyScanResult);
     }
 
@@ -707,7 +711,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       confirmed,
       alreadyOnDolly: false,
       complete,
-      message: complete ? 'Dolly complet — tous les bagages enregistrés sont chargés.' : 'Bagage sûr — placé sur le dolly.',
+      message: complete ? 'Dolly complet. Tous les bagages enregistrés sont chargés.' : 'Bagage vérifié, placé sur le dolly.',
     } satisfies DollyScanResult);
   });
 
@@ -760,18 +764,18 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     }
 
     if (!bagRow) {
-      return reply.send({ status: 'rejected', message: 'Bagage inconnu sur ce vol.' } satisfies ArrivalScanResult);
+      return reply.send({ status: 'rejected', message: "Ce bagage n'appartient pas à ce vol." } satisfies ArrivalScanResult);
     }
     if (bagRow.rush) {
       return reply.send({
         status: 'rejected',
-        message: 'Bagage marqué rush, resté au départ. Il arrivera sur un autre vol.',
+        message: 'Ce bagage était marqué rush, il est resté au départ. Il arrivera sur un autre vol.',
       } satisfies ArrivalScanResult);
     }
     if (!bagRow.in_hold) {
       return reply.send({
         status: 'rejected',
-        message: 'Bagage non chargé sur ce vol, il n’aurait pas dû voyager.',
+        message: "Ce bagage n'a pas été chargé sur ce vol, il n'aurait pas dû voyager. Prévenez le superviseur.",
       } satisfies ArrivalScanResult);
     }
 
@@ -833,7 +837,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     try {
       parsed = parseBoardingPass(raw);
     } catch {
-      return reply.code(400).send({ error: '⚠️ Boarding pass illisible — rescannez.' });
+      return reply.code(400).send({ error: 'Boarding pass illisible. Rescannez le billet.' });
     }
     const supabase = getSupabase();
 
@@ -850,7 +854,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     if (!flightNumbersMatch(parsed.flightNumber, flight.flight_number)) {
       const result: BoardingGateResult = {
         status: 'rejected',
-        message: `⚠️ Boarding pass ${parsed.flightNumber || '—'} — vol ${flight.flight_number}. Mauvais vol.`,
+        message: `Ce billet est pour le vol ${parsed.flightNumber || 'inconnu'}, pas pour ${flight.flight_number}.`,
       };
       return reply.send(result);
     }
@@ -867,7 +871,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     if (!passenger) {
       const result: BoardingGateResult = {
         status: 'rejected',
-        message: '⚠️ Passager non enregistré — check-in requis avant embarquement.',
+        message: "Ce passager n'a pas encore fait son check-in. Envoyez-le au comptoir.",
       };
       return reply.send(result);
     }

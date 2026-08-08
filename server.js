@@ -166,29 +166,36 @@ function rejectWithAlert(ctx, reason, message) {
 function evaluateBaggageScan(ctx) {
   const { registeredBag, passenger, parsedTag } = ctx;
   if (ctx.duplicateConfirmedTag) {
-    return reject(FRAUD_REASON.ALREADY_SCANNED, "\u26A0\uFE0F Bagage d\xE9j\xE0 enregistr\xE9");
+    return reject(FRAUD_REASON.ALREADY_SCANNED, "Ce bagage a d\xE9j\xE0 \xE9t\xE9 enregistr\xE9. Passez au suivant.");
   }
   if (!registeredBag || !passenger) {
-    return rejectWithAlert(ctx, FRAUD_REASON.UNLINKED_TAG, "Bagage non autoris\xE9 \u2014 superviseur alert\xE9");
+    return rejectWithAlert(
+      ctx,
+      FRAUD_REASON.UNLINKED_TAG,
+      "Bagage refus\xE9. Aucun passager n'a d\xE9clar\xE9 cette \xE9tiquette. Mettez le bagage de c\xF4t\xE9, le superviseur arrive."
+    );
   }
   if (passenger.flightId !== ctx.flightId) {
-    return reject(FRAUD_REASON.WRONG_FLIGHT, "Bagage appartient \xE0 un autre vol");
+    return reject(
+      FRAUD_REASON.WRONG_FLIGHT,
+      "Ce bagage n'est pas sur le bon tapis. Il appartient \xE0 un autre vol."
+    );
   }
   if (registeredBag.isConfirmed) {
-    return reject(FRAUD_REASON.ALREADY_SCANNED, "\u26A0\uFE0F Bagage d\xE9j\xE0 enregistr\xE9");
+    return reject(FRAUD_REASON.ALREADY_SCANNED, "Ce bagage a d\xE9j\xE0 \xE9t\xE9 enregistr\xE9. Passez au suivant.");
   }
   if (passenger.declaredBaggageCount === 0) {
     return rejectWithAlert(
       ctx,
       FRAUD_REASON.ZERO_DECLARED,
-      "Bagage non autoris\xE9 \u2014 superviseur alert\xE9"
+      `Bagage refus\xE9. ${passenger.fullName} voyage sans bagage en soute. Mettez le bagage de c\xF4t\xE9, le superviseur arrive.`
     );
   }
   if (ctx.confirmedCountForPassenger >= passenger.declaredBaggageCount) {
     return rejectWithAlert(
       ctx,
       FRAUD_REASON.QUOTA_EXCEEDED,
-      "Bagage non autoris\xE9 \u2014 quota d\xE9pass\xE9, superviseur alert\xE9"
+      `Bagage refus\xE9. ${passenger.fullName} a d\xE9j\xE0 ses ${passenger.declaredBaggageCount} bagage${passenger.declaredBaggageCount > 1 ? "s" : ""}. Mettez celui-ci de c\xF4t\xE9, le superviseur arrive.`
     );
   }
   return {
@@ -253,7 +260,7 @@ async function findTagOnOtherFlights(supabase, flightId, parsedTag) {
   ).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
   const bag = row;
   if (!bag) return null;
-  return { bag, flightNumber: others.find((f) => f.id === bag.flight_id)?.flight_number ?? "\u2014" };
+  return { bag, flightNumber: others.find((f) => f.id === bag.flight_id)?.flight_number ?? "inconnu" };
 }
 async function describeUnlinkedTag(supabase, flightId, parsedTag) {
   const prefix = `${parsedTag.issuerCode}${parsedTag.airlineNumericCode}`;
@@ -265,9 +272,9 @@ async function describeUnlinkedTag(supabase, flightId, parsedTag) {
   const lo = first?.serial_number ?? null;
   const hi = last?.serial_number ?? null;
   if (!lo || !hi) {
-    return `Aucune \xE9tiquette ${prefix} encore d\xE9clar\xE9e sur ce vol : impossible de situer la s\xE9rie ${serial}. V\xE9rifier que le check-in a bien \xE9t\xE9 scann\xE9.`;
+    return "Aucun bagage n'est encore enregistr\xE9 sur ce vol. V\xE9rifier que le comptoir a commenc\xE9 \xE0 scanner les boarding pass.";
   }
-  return serial >= lo && serial <= hi ? `S\xE9rie ${serial} dans la plage imprim\xE9e pour ce vol (${lo} \xE0 ${hi}) : \xE9tiquette \xE9mise au comptoir sur un dossier sans bagage d\xE9clar\xE9. Colis \xE0 intercepter.` : `S\xE9rie ${serial} hors de la plage imprim\xE9e pour ce vol (${lo} \xE0 ${hi}) : \xE9tiquette \xE9trang\xE8re \xE0 ce vol.`;
+  return serial >= lo && serial <= hi ? "\xC9tiquette imprim\xE9e au comptoir pour ce vol, mais aucun passager ne l'a d\xE9clar\xE9e. Faire intercepter le colis avant le chargement." : "Cette \xE9tiquette ne vient pas du comptoir de ce vol. Bagage probablement \xE9gar\xE9, \xE0 mettre de c\xF4t\xE9.";
 }
 async function scanRoutes(app2) {
   app2.addHook("preHandler", authenticate);
@@ -281,7 +288,7 @@ async function scanRoutes(app2) {
     try {
       parsed = parseBoardingPass(raw);
     } catch {
-      return reply.code(400).send({ error: "\u26A0\uFE0F Boarding pass illisible \u2014 rescannez." });
+      return reply.code(400).send({ error: "Boarding pass illisible. Rescannez le billet." });
     }
     const supabase = getSupabase();
     const { data: flight, error: flightErr } = await supabase.from("flights").select("flight_number, date").eq("id", flightId).single();
@@ -290,7 +297,7 @@ async function scanRoutes(app2) {
     }
     if (!flightNumbersMatch(parsed.flightNumber, flight.flight_number)) {
       return reply.code(409).send({
-        error: `\u26A0\uFE0F Boarding pass ${parsed.flightNumber || "\u2014"} \u2014 vol ${flight.flight_number}. Mauvais vol.`
+        error: `Ce billet est pour le vol ${parsed.flightNumber || "inconnu"}, pas pour ${flight.flight_number}.`
       });
     }
     const { data: passenger, error } = await supabase.from("passengers").insert({
@@ -306,7 +313,7 @@ async function scanRoutes(app2) {
     }).select().single();
     if (error) {
       if (error.code === "23505") {
-        return reply.code(409).send({ error: "\u26A0\uFE0F Passager d\xE9j\xE0 enregistr\xE9" });
+        return reply.code(409).send({ error: "Ce passager est d\xE9j\xE0 enregistr\xE9." });
       }
       request.log.error(error);
       return reply.code(500).send({ error: "\xC9chec de l'enregistrement du passager" });
@@ -351,7 +358,7 @@ async function scanRoutes(app2) {
           resolved: true,
           resolved_at: (/* @__PURE__ */ new Date()).toISOString(),
           resolved_by: scannedBy ?? null,
-          note: `R\xE9solue automatiquement : check-in de ${parsed.fullName} (PNR ${parsed.pnr}) sur ${flight.flight_number} post\xE9rieur au scan du bagage. L'\xE9tiquette est d\xE9clar\xE9e sur son boarding pass.`
+          note: `Fausse alerte. ${parsed.fullName} (PNR ${parsed.pnr}) s'est enregistr\xE9 sur ${flight.flight_number} apr\xE8s le passage du bagage. L'\xE9tiquette est bien sur son billet, il n'y a pas de fraude. Le bagage peut \xEAtre repass\xE9 au tapis.`
         }).in("flight_id", dayIds).eq("resolved", false).in(
           "tag_number",
           preRegistered.map((b) => b.tag_number)
@@ -389,7 +396,7 @@ async function scanRoutes(app2) {
     if (!linkedBag) {
       const elsewhere = await findTagOnOtherFlights(supabase, flightId, parsedTag);
       linkedBag = elsewhere?.bag ?? null;
-      tagNote = elsewhere ? `\xC9tiquette enregistr\xE9e sur le vol ${elsewhere.flightNumber}, pas sur celui-ci.` : await describeUnlinkedTag(supabase, flightId, parsedTag);
+      tagNote = elsewhere ? `Ce bagage est celui du vol ${elsewhere.flightNumber}. Il s'est tromp\xE9 de tapis.` : await describeUnlinkedTag(supabase, flightId, parsedTag);
     }
     let passenger = null;
     let confirmedCount = 0;
@@ -447,12 +454,12 @@ async function scanRoutes(app2) {
     const supabase = getSupabase();
     const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
     if (!bagRow) {
-      return { code: 200, result: { status: "rejected", message: "Bagage inconnu sur ce vol." } };
+      return { code: 200, result: { status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol." } };
     }
     if (!bagRow.is_confirmed) {
       return {
         code: 200,
-        result: { status: "rejected", message: "Bagage non enregistr\xE9 au tapis \u2014 confirmez-le d\u2019abord." }
+        result: { status: "rejected", message: "Ce bagage n'est pas encore pass\xE9 au tapis. Enregistrez-le d'abord." }
       };
     }
     const stamp = (/* @__PURE__ */ new Date()).toISOString();
@@ -521,10 +528,10 @@ async function scanRoutes(app2) {
     const supabase = getSupabase();
     const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
     if (!bagRow) {
-      return reply.send({ status: "rejected", message: "Bagage inconnu sur ce vol." });
+      return reply.send({ status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol." });
     }
     if (!bagRow.is_confirmed) {
-      return reply.send({ status: "rejected", message: "Bagage non enregistr\xE9 au tapis \u2014 confirmez-le d'abord." });
+      return reply.send({ status: "rejected", message: "Ce bagage n'est pas encore pass\xE9 au tapis. Enregistrez-le d'abord." });
     }
     const stamp = (/* @__PURE__ */ new Date()).toISOString();
     await supabase.from("baggage").update({ soute, soute_at: stamp, soute_by: scannedBy ?? null, tag_number: tag }).eq("id", bagRow.id);
@@ -562,12 +569,12 @@ async function scanRoutes(app2) {
       return { onDolly: onDolly2 ?? 0, confirmed: confirmed2 ?? 0 };
     }
     if (!bagRow) {
-      return reply.send({ status: "rejected", message: "Bagage inconnu sur ce vol \u2014 ne pas charger." });
+      return reply.send({ status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol. Ne pas le charger." });
     }
     if (!bagRow.is_confirmed) {
       return reply.send({
         status: "rejected",
-        message: "Bagage non enregistr\xE9 au tapis \u2014 ne pas charger."
+        message: "Ce bagage n'est pas pass\xE9 au tapis. Ne pas le charger."
       });
     }
     const { data: pax } = await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single();
@@ -595,7 +602,7 @@ async function scanRoutes(app2) {
       confirmed,
       alreadyOnDolly: false,
       complete,
-      message: complete ? "Dolly complet \u2014 tous les bagages enregistr\xE9s sont charg\xE9s." : "Bagage s\xFBr \u2014 plac\xE9 sur le dolly."
+      message: complete ? "Dolly complet. Tous les bagages enregistr\xE9s sont charg\xE9s." : "Bagage v\xE9rifi\xE9, plac\xE9 sur le dolly."
     });
   });
   app2.post("/scan/arrivee", async (request, reply) => {
@@ -620,18 +627,18 @@ async function scanRoutes(app2) {
       return { arrived: arrived2 ?? 0, expected: expected2 ?? 0 };
     }
     if (!bagRow) {
-      return reply.send({ status: "rejected", message: "Bagage inconnu sur ce vol." });
+      return reply.send({ status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol." });
     }
     if (bagRow.rush) {
       return reply.send({
         status: "rejected",
-        message: "Bagage marqu\xE9 rush, rest\xE9 au d\xE9part. Il arrivera sur un autre vol."
+        message: "Ce bagage \xE9tait marqu\xE9 rush, il est rest\xE9 au d\xE9part. Il arrivera sur un autre vol."
       });
     }
     if (!bagRow.in_hold) {
       return reply.send({
         status: "rejected",
-        message: "Bagage non charg\xE9 sur ce vol, il n\u2019aurait pas d\xFB voyager."
+        message: "Ce bagage n'a pas \xE9t\xE9 charg\xE9 sur ce vol, il n'aurait pas d\xFB voyager. Pr\xE9venez le superviseur."
       });
     }
     const { data: pax } = await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single();
@@ -672,7 +679,7 @@ async function scanRoutes(app2) {
     try {
       parsed = parseBoardingPass(raw);
     } catch {
-      return reply.code(400).send({ error: "\u26A0\uFE0F Boarding pass illisible \u2014 rescannez." });
+      return reply.code(400).send({ error: "Boarding pass illisible. Rescannez le billet." });
     }
     const supabase = getSupabase();
     const { data: flight, error: flightErr } = await supabase.from("flights").select("flight_number").eq("id", flightId).single();
@@ -682,7 +689,7 @@ async function scanRoutes(app2) {
     if (!flightNumbersMatch(parsed.flightNumber, flight.flight_number)) {
       const result2 = {
         status: "rejected",
-        message: `\u26A0\uFE0F Boarding pass ${parsed.flightNumber || "\u2014"} \u2014 vol ${flight.flight_number}. Mauvais vol.`
+        message: `Ce billet est pour le vol ${parsed.flightNumber || "inconnu"}, pas pour ${flight.flight_number}.`
       };
       return reply.send(result2);
     }
@@ -690,7 +697,7 @@ async function scanRoutes(app2) {
     if (!passenger) {
       const result2 = {
         status: "rejected",
-        message: "\u26A0\uFE0F Passager non enregistr\xE9 \u2014 check-in requis avant embarquement."
+        message: "Ce passager n'a pas encore fait son check-in. Envoyez-le au comptoir."
       };
       return reply.send(result2);
     }
