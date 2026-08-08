@@ -34,12 +34,22 @@ describe('evaluateBaggageScan', () => {
     expect(d.fraudAlert).toBeNull();
   });
 
-  it('Règle 1 — serial introuvable → alerte PASSENGER_NOT_REGISTERED', () => {
+  it('Règle 1 — serial introuvable → alerte UNLINKED_TAG', () => {
     const d = evaluateBaggageScan(ctx({ registeredBag: null, passenger: null }));
-    expect(d.result).toMatchObject({ status: 'rejected', reason: FRAUD_REASON.PASSENGER_NOT_REGISTERED, fraudAlert: true });
-    expect(d.fraudAlert?.reason).toBe(FRAUD_REASON.PASSENGER_NOT_REGISTERED);
+    expect(d.result).toMatchObject({ status: 'rejected', reason: FRAUD_REASON.UNLINKED_TAG, fraudAlert: true });
+    expect(d.fraudAlert?.reason).toBe(FRAUD_REASON.UNLINKED_TAG);
     expect(d.fraudAlert?.tag_number).toBe('0071161002');
     expect(d.confirmBagId).toBeNull();
+  });
+
+  it("Règle 1 — le diagnostic de la route est recopié dans l'alerte", () => {
+    // Une alerte règle 1 n'a ni nom ni PNR : sans cette note, le superviseur
+    // reçoit un numéro d'étiquette et rien d'autre.
+    const note = 'Série 161002 dans la plage imprimée pour ce vol (160000 à 162000).';
+    const d = evaluateBaggageScan(ctx({ registeredBag: null, passenger: null, tagNote: note }));
+    expect(d.fraudAlert?.note).toBe(note);
+    expect(d.fraudAlert?.pnr).toBeNull();
+    expect(d.fraudAlert?.passenger_name).toBeNull();
   });
 
   it('Règle 2 — 0 bagage déclaré → alerte ZERO_DECLARED', () => {
@@ -75,6 +85,21 @@ describe('evaluateBaggageScan', () => {
       ctx({ passenger: { id: 'pax-1', fullName: 'X', pnr: 'P', flightId: 'autre-vol', declaredBaggageCount: 2 } }),
     );
     expect(d.result).toMatchObject({ status: 'rejected', reason: FRAUD_REASON.WRONG_FLIGHT, fraudAlert: false });
+  });
+
+  it("Règle 5 prime sur la règle 1 — une étiquette d'un autre vol n'est pas une fraude", () => {
+    // La route fournit désormais la ligne baggage trouvée sur un autre vol du
+    // jour. Sans elle, ce cas retombait en règle 1 et alertait le superviseur
+    // pour une simple erreur de tapis.
+    const d = evaluateBaggageScan(
+      ctx({
+        registeredBag: { id: 'bag-9', passengerId: 'pax-9', tagNumber: '0071161002', isConfirmed: true },
+        passenger: { id: 'pax-9', fullName: 'Y', pnr: 'Q', flightId: 'autre-vol', declaredBaggageCount: 0 },
+      }),
+    );
+    expect(d.result).toMatchObject({ status: 'rejected', reason: FRAUD_REASON.WRONG_FLIGHT, fraudAlert: false });
+    expect(d.fraudAlert).toBeNull();
+    expect(d.confirmBagId).toBeNull();
   });
 
   it('confirme le 2e bagage quand 1 est déjà confirmé (sous quota)', () => {

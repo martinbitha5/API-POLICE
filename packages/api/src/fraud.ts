@@ -32,7 +32,13 @@ export interface BaggageScanContext {
   parsedTag: ParsedBaggageTag;
   flightId: string;
   gate: string | null;
-  /** Ligne baggage correspondant à serial_number + flight_id, ou null si introuvable. */
+  /**
+   * Ligne baggage correspondant à serial_number, ou null si introuvable.
+   * Peut venir d'un AUTRE vol du même jour : c'est ce qui rend la règle 5
+   * atteignable. Tant que la recherche restait filtrée sur le vol courant,
+   * `passenger.flightId` valait toujours `flightId` et le test « mauvais vol »
+   * ne pouvait jamais être vrai.
+   */
   registeredBag: RegisteredBag | null;
   /** Passager propriétaire du registeredBag, ou null. */
   passenger: ScanPassenger | null;
@@ -40,6 +46,12 @@ export interface BaggageScanContext {
   confirmedCountForPassenger: number;
   /** true si ce tag_number exact est déjà confirmé (doublon de scan). */
   duplicateConfirmedTag: boolean;
+  /**
+   * Diagnostic de liaison rédigé par la route (plage de séries du vol, vol
+   * d'origine de l'étiquette…). Recopié dans l'alerte : une alerte règle 1 n'a
+   * ni nom ni PNR, c'est la seule information exploitable par le superviseur.
+   */
+  tagNote?: string | null;
 }
 
 /** Brouillon d'alerte fraude à insérer (règles 1, 2, 3 uniquement). */
@@ -51,6 +63,7 @@ export interface FraudAlertDraft {
   declared_baggage_count: number | null;
   gate: string | null;
   reason: FraudReason;
+  note: string | null;
 }
 
 export interface BaggageScanDecision {
@@ -76,6 +89,7 @@ function rejectWithAlert(ctx: BaggageScanContext, reason: FraudReason, message: 
       declared_baggage_count: ctx.passenger?.declaredBaggageCount ?? null,
       gate: ctx.gate,
       reason,
+      note: ctx.tagNote ?? null,
     },
     confirmBagId: null,
   };
@@ -89,13 +103,10 @@ export function evaluateBaggageScan(ctx: BaggageScanContext): BaggageScanDecisio
     return reject(FRAUD_REASON.ALREADY_SCANNED, '⚠️ Bagage déjà enregistré');
   }
 
-  // Règle 1 — aucun bagage déclaré pour ce serial sur ce vol → passager non enregistré.
+  // Règle 1 — ce n° de série n'est déclaré sur aucun boarding pass. On ne peut
+  // nommer personne : l'étiquette est orpheline, c'est tout ce qu'on sait.
   if (!registeredBag || !passenger) {
-    return rejectWithAlert(
-      ctx,
-      FRAUD_REASON.PASSENGER_NOT_REGISTERED,
-      'Bagage non autorisé — superviseur alerté',
-    );
+    return rejectWithAlert(ctx, FRAUD_REASON.UNLINKED_TAG, 'Bagage non autorisé — superviseur alerté');
   }
 
   // Règle 5 — bagage rattaché à un autre vol. Pas d'alerte fraude.

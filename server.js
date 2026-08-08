@@ -93,6 +93,16 @@ function extractBaggageTags(parsed) {
 
 // packages/shared/src/types.ts
 var FRAUD_REASON = {
+  /**
+   * Règle 1 — l'étiquette ne correspond à aucun bagage déclaré sur un boarding
+   * pass de ce vol. On ne sait pas à qui elle appartient : le libellé décrit ce
+   * qu'on constate (une étiquette orpheline), pas une conclusion sur le passager.
+   */
+  UNLINKED_TAG: "\xC9tiquette non rattach\xE9e \xE0 un passager",
+  /**
+   * @deprecated Ancien libellé de la règle 1, conservé pour les alertes
+   * historiques déjà en base. Ne plus émettre : voir UNLINKED_TAG.
+   */
   PASSENGER_NOT_REGISTERED: "Passager non enregistr\xE9",
   ZERO_DECLARED: "0 bagage d\xE9clar\xE9 sur boarding pass",
   QUOTA_EXCEEDED: "Quota bagage d\xE9pass\xE9",
@@ -147,7 +157,8 @@ function rejectWithAlert(ctx, reason, message) {
       tag_number: ctx.parsedTag.rawTag,
       declared_baggage_count: ctx.passenger?.declaredBaggageCount ?? null,
       gate: ctx.gate,
-      reason
+      reason,
+      note: ctx.tagNote ?? null
     },
     confirmBagId: null
   };
@@ -158,11 +169,7 @@ function evaluateBaggageScan(ctx) {
     return reject(FRAUD_REASON.ALREADY_SCANNED, "\u26A0\uFE0F Bagage d\xE9j\xE0 enregistr\xE9");
   }
   if (!registeredBag || !passenger) {
-    return rejectWithAlert(
-      ctx,
-      FRAUD_REASON.PASSENGER_NOT_REGISTERED,
-      "Bagage non autoris\xE9 \u2014 superviseur alert\xE9"
-    );
+    return rejectWithAlert(ctx, FRAUD_REASON.UNLINKED_TAG, "Bagage non autoris\xE9 \u2014 superviseur alert\xE9");
   }
   if (passenger.flightId !== ctx.flightId) {
     return reject(FRAUD_REASON.WRONG_FLIGHT, "Bagage appartient \xE0 un autre vol");
@@ -231,6 +238,37 @@ async function authenticate(request, reply) {
 }
 
 // packages/api/src/routes/scan.ts
+async function findTagOnOtherFlights(supabase, flightId, parsedTag) {
+  const { data: current } = await supabase.from("flights").select("date").eq("id", flightId).single();
+  const date = current?.date;
+  if (!date) return null;
+  const { data: sameDay } = await supabase.from("flights").select("id, flight_number").eq("date", date);
+  const others = (sameDay ?? []).filter(
+    (f) => f.id !== flightId
+  );
+  if (others.length === 0) return null;
+  const { data: row } = await supabase.from("baggage").select("id, passenger_id, tag_number, is_confirmed, flight_id").in(
+    "flight_id",
+    others.map((f) => f.id)
+  ).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+  const bag = row;
+  if (!bag) return null;
+  return { bag, flightNumber: others.find((f) => f.id === bag.flight_id)?.flight_number ?? "\u2014" };
+}
+async function describeUnlinkedTag(supabase, flightId, parsedTag) {
+  const prefix = `${parsedTag.issuerCode}${parsedTag.airlineNumericCode}`;
+  const [{ data: first }, { data: last }] = await Promise.all([
+    supabase.from("baggage").select("serial_number").eq("flight_id", flightId).like("tag_number", `${prefix}%`).order("serial_number", { ascending: true }).limit(1).maybeSingle(),
+    supabase.from("baggage").select("serial_number").eq("flight_id", flightId).like("tag_number", `${prefix}%`).order("serial_number", { ascending: false }).limit(1).maybeSingle()
+  ]);
+  const serial = parsedTag.serialNumber;
+  const lo = first?.serial_number ?? null;
+  const hi = last?.serial_number ?? null;
+  if (!lo || !hi) {
+    return `Aucune \xE9tiquette ${prefix} encore d\xE9clar\xE9e sur ce vol : impossible de situer la s\xE9rie ${serial}. V\xE9rifier que le check-in a bien \xE9t\xE9 scann\xE9.`;
+  }
+  return serial >= lo && serial <= hi ? `S\xE9rie ${serial} dans la plage imprim\xE9e pour ce vol (${lo} \xE0 ${hi}) : \xE9tiquette \xE9mise au comptoir sur un dossier sans bagage d\xE9clar\xE9. Colis \xE0 intercepter.` : `S\xE9rie ${serial} hors de la plage imprim\xE9e pour ce vol (${lo} \xE0 ${hi}) : \xE9tiquette \xE9trang\xE8re \xE0 ce vol.`;
+}
 async function scanRoutes(app2) {
   app2.addHook("preHandler", authenticate);
   app2.post("/scan/boarding", async (request, reply) => {
@@ -246,7 +284,7 @@ async function scanRoutes(app2) {
       return reply.code(400).send({ error: "\u26A0\uFE0F Boarding pass illisible \u2014 rescannez." });
     }
     const supabase = getSupabase();
-    const { data: flight, error: flightErr } = await supabase.from("flights").select("flight_number").eq("id", flightId).single();
+    const { data: flight, error: flightErr } = await supabase.from("flights").select("flight_number, date").eq("id", flightId).single();
     if (flightErr || !flight) {
       return reply.code(404).send({ error: "Vol introuvable" });
     }
@@ -306,6 +344,19 @@ async function scanRoutes(app2) {
     });
     if (preRegistered.length > 0) {
       await supabase.from("baggage").upsert(preRegistered, { onConflict: "flight_id,tag_number", ignoreDuplicates: true });
+      const { data: dayFlights } = await supabase.from("flights").select("id").eq("date", flight.date);
+      const dayIds = (dayFlights ?? []).map((f) => f.id);
+      if (dayIds.length > 0) {
+        await supabase.from("fraud_alerts").update({
+          resolved: true,
+          resolved_at: (/* @__PURE__ */ new Date()).toISOString(),
+          resolved_by: scannedBy ?? null,
+          note: `R\xE9solue automatiquement : check-in de ${parsed.fullName} (PNR ${parsed.pnr}) sur ${flight.flight_number} post\xE9rieur au scan du bagage. L'\xE9tiquette est d\xE9clar\xE9e sur son boarding pass.`
+        }).in("flight_id", dayIds).eq("resolved", false).in(
+          "tag_number",
+          preRegistered.map((b) => b.tag_number)
+        );
+      }
     }
     return reply.send({
       passenger: {
@@ -333,10 +384,17 @@ async function scanRoutes(app2) {
     const supabase = getSupabase();
     const { data: dupRow } = await supabase.from("baggage").select("id").eq("flight_id", flightId).eq("tag_number", tag).eq("is_confirmed", true).maybeSingle();
     const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, tag_number, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: true }).limit(1).maybeSingle();
+    let linkedBag = bagRow ?? null;
+    let tagNote = null;
+    if (!linkedBag) {
+      const elsewhere = await findTagOnOtherFlights(supabase, flightId, parsedTag);
+      linkedBag = elsewhere?.bag ?? null;
+      tagNote = elsewhere ? `\xC9tiquette enregistr\xE9e sur le vol ${elsewhere.flightNumber}, pas sur celui-ci.` : await describeUnlinkedTag(supabase, flightId, parsedTag);
+    }
     let passenger = null;
     let confirmedCount = 0;
-    if (bagRow) {
-      const { data: pax } = await supabase.from("passengers").select("id, full_name, pnr, flight_id, declared_baggage_count").eq("id", bagRow.passenger_id).single();
+    if (linkedBag) {
+      const { data: pax } = await supabase.from("passengers").select("id, full_name, pnr, flight_id, declared_baggage_count").eq("id", linkedBag.passenger_id).single();
       if (pax) {
         passenger = {
           id: pax.id,
@@ -353,10 +411,16 @@ async function scanRoutes(app2) {
       parsedTag,
       flightId,
       gate: gate ?? null,
-      registeredBag: bagRow ? { id: bagRow.id, passengerId: bagRow.passenger_id, tagNumber: bagRow.tag_number, isConfirmed: bagRow.is_confirmed } : null,
+      registeredBag: linkedBag ? {
+        id: linkedBag.id,
+        passengerId: linkedBag.passenger_id,
+        tagNumber: linkedBag.tag_number,
+        isConfirmed: linkedBag.is_confirmed
+      } : null,
       passenger,
       confirmedCountForPassenger: confirmedCount,
-      duplicateConfirmedTag: Boolean(dupRow)
+      duplicateConfirmedTag: Boolean(dupRow),
+      tagNote
     });
     if (decision.confirmBagId) {
       await supabase.from("baggage").update({ is_confirmed: true, tag_number: tag, scanned_by: scannedBy ?? null, scanned_at: (/* @__PURE__ */ new Date()).toISOString() }).eq("id", decision.confirmBagId);

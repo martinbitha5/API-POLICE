@@ -36,6 +36,16 @@ export const DISPUTE_STATUS_LABEL: Record<DisputeStatus, string> = {
 
 /** Raisons de rejet d'un bagage (règles anti-fraude 1 à 5). */
 export const FRAUD_REASON = {
+  /**
+   * Règle 1 — l'étiquette ne correspond à aucun bagage déclaré sur un boarding
+   * pass de ce vol. On ne sait pas à qui elle appartient : le libellé décrit ce
+   * qu'on constate (une étiquette orpheline), pas une conclusion sur le passager.
+   */
+  UNLINKED_TAG: 'Étiquette non rattachée à un passager',
+  /**
+   * @deprecated Ancien libellé de la règle 1, conservé pour les alertes
+   * historiques déjà en base. Ne plus émettre : voir UNLINKED_TAG.
+   */
   PASSENGER_NOT_REGISTERED: 'Passager non enregistré',
   ZERO_DECLARED: '0 bagage déclaré sur boarding pass',
   QUOTA_EXCEEDED: 'Quota bagage dépassé',
@@ -188,7 +198,15 @@ export interface FraudAlert {
   declared_baggage_count: number | null;
   gate: string | null;
   reason: string;
+  /**
+   * Diagnostic de liaison au moment du rejet (d'où vient l'étiquette, ce qu'on
+   * a cherché), ou explication de la résolution. Sans ça, une alerte règle 1
+   * n'affiche ni nom ni PNR et le superviseur n'a rien pour agir.
+   */
+  note: string | null;
   resolved: boolean;
+  resolved_at: string | null;
+  resolved_by: string | null;
   created_at: string;
 }
 

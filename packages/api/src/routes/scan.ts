@@ -1,7 +1,9 @@
 import type { FastifyInstance } from 'fastify';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { parseBoardingPass, parseBaggageTag } from '@police/bcbp-parser';
 import {
   flightNumbersMatch,
+  type ParsedBaggageTag,
   type BoardingGateResult,
   type BaggageActionResult,
   type BaggageLoadAllResult,
@@ -45,6 +47,111 @@ interface SouteBody {
   scannedBy?: string;
 }
 
+/** Ligne `baggage` réduite à ce dont la décision anti-fraude a besoin. */
+interface LinkedBagRow {
+  id: string;
+  passenger_id: string;
+  tag_number: string;
+  is_confirmed: boolean;
+}
+
+/**
+ * Cherche le même n° de série sur les AUTRES vols du jour.
+ *
+ * Sans cette recherche, la règle 5 était inatteignable : la requête de liaison
+ * étant filtrée sur le vol courant, `passenger.flightId` valait toujours le vol
+ * scanné et le test « bagage d'un autre vol » ne pouvait jamais être vrai. Un
+ * bagage posé sur le mauvais tapis remontait donc au superviseur comme une
+ * fraude, au même titre qu'un colis sans boarding pass.
+ *
+ * Bornée au même jour : le n° de série ne fait que 6 chiffres et se recycle
+ * d'un jour sur l'autre. Chercher plus loin rattacherait un bagage à un vol de
+ * la veille.
+ */
+async function findTagOnOtherFlights(
+  supabase: SupabaseClient,
+  flightId: string,
+  parsedTag: ParsedBaggageTag,
+): Promise<{ bag: LinkedBagRow; flightNumber: string } | null> {
+  const { data: current } = await supabase.from('flights').select('date').eq('id', flightId).single();
+  const date = (current as { date: string } | null)?.date;
+  if (!date) return null;
+
+  const { data: sameDay } = await supabase.from('flights').select('id, flight_number').eq('date', date);
+  const others = ((sameDay as { id: string; flight_number: string }[] | null) ?? []).filter(
+    (f) => f.id !== flightId,
+  );
+  if (others.length === 0) return null;
+
+  const { data: row } = await supabase
+    .from('baggage')
+    .select('id, passenger_id, tag_number, is_confirmed, flight_id')
+    .in(
+      'flight_id',
+      others.map((f) => f.id),
+    )
+    .eq('serial_number', parsedTag.serialNumber)
+    .order('is_confirmed', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const bag = row as (LinkedBagRow & { flight_id: string }) | null;
+  if (!bag) return null;
+  return { bag, flightNumber: others.find((f) => f.id === bag.flight_id)?.flight_number ?? '—' };
+}
+
+/**
+ * Étiquette orpheline : aucun boarding pass ne la déclare, donc aucun nom à
+ * afficher. On dit alors ce qu'on sait, c'est-à-dire d'où sort la série.
+ *
+ * Les étiquettes d'un comptoir sont imprimées en série continue pour un vol.
+ * Une série qui tombe dans la plage déjà vue sur ce vol désigne un colis
+ * étiqueté ici, sur un dossier sans bagage déclaré — le scénario de fraude.
+ * Hors de cette plage, il s'agit plutôt d'un bagage étranger au vol.
+ *
+ * C'est un indice de provenance, pas une identification : on ne devine jamais
+ * un propriétaire par proximité de série, attribuer une fraude au mauvais
+ * passager serait pire que de ne nommer personne.
+ */
+async function describeUnlinkedTag(
+  supabase: SupabaseClient,
+  flightId: string,
+  parsedTag: ParsedBaggageTag,
+): Promise<string> {
+  const prefix = `${parsedTag.issuerCode}${parsedTag.airlineNumericCode}`;
+  const [{ data: first }, { data: last }] = await Promise.all([
+    supabase
+      .from('baggage')
+      .select('serial_number')
+      .eq('flight_id', flightId)
+      .like('tag_number', `${prefix}%`)
+      .order('serial_number', { ascending: true })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from('baggage')
+      .select('serial_number')
+      .eq('flight_id', flightId)
+      .like('tag_number', `${prefix}%`)
+      .order('serial_number', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+
+  const serial = parsedTag.serialNumber;
+  const lo = (first as { serial_number: string | null } | null)?.serial_number ?? null;
+  const hi = (last as { serial_number: string | null } | null)?.serial_number ?? null;
+
+  if (!lo || !hi) {
+    return `Aucune étiquette ${prefix} encore déclarée sur ce vol : impossible de situer la série ${serial}. Vérifier que le check-in a bien été scanné.`;
+  }
+  // Séries à 6 chiffres complétées à gauche par des zéros : l'ordre
+  // lexicographique est l'ordre numérique.
+  return serial >= lo && serial <= hi
+    ? `Série ${serial} dans la plage imprimée pour ce vol (${lo} à ${hi}) : étiquette émise au comptoir sur un dossier sans bagage déclaré. Colis à intercepter.`
+    : `Série ${serial} hors de la plage imprimée pour ce vol (${lo} à ${hi}) : étiquette étrangère à ce vol.`;
+}
+
 export async function scanRoutes(app: FastifyInstance): Promise<void> {
   // Toutes les routes de scan exigent un agent/superviseur/admin authentifié.
   // L'identité du scanneur est dérivée du JWT (request.authUserId), jamais du body.
@@ -72,7 +179,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     // fraude : c'est une erreur de porte, pas une fraude bagage.
     const { data: flight, error: flightErr } = await supabase
       .from('flights')
-      .select('flight_number')
+      .select('flight_number, date')
       .eq('id', flightId)
       .single();
 
@@ -152,6 +259,39 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
     if (preRegistered.length > 0) {
       await supabase.from('baggage').upsert(preRegistered, { onConflict: 'flight_id,tag_number', ignoreDuplicates: true });
+
+      // Course de scan : l'agent bagages passe parfois le tapis avant que le
+      // check-in n'ait enregistré le passager. La ligne baggage n'existait pas
+      // encore, la règle 1 s'est donc déclenchée à tort. Le boarding pass qu'on
+      // vient de lire prouve le contraire — on referme ces alertes au lieu de
+      // les laisser vivre comme des fraudes non résolues.
+      //
+      // Le rejet au tapis reste inchangé : le bagage a bien été écarté sur le
+      // moment et devra être rescanné. Aucune règle n'est contournée, on ne
+      // corrige que la trace laissée au superviseur.
+      //
+      // Balayage sur tous les vols du jour, pas seulement celui-ci : une
+      // étiquette scannée sur le mauvais tapis lève une alerte sur le vol du
+      // tapis, alors que le boarding pass qui la justifie arrive sur un autre
+      // vol. Bornée au jour même, le n° de série se recyclant ensuite.
+      const { data: dayFlights } = await supabase.from('flights').select('id').eq('date', flight.date);
+      const dayIds = ((dayFlights as { id: string }[] | null) ?? []).map((f) => f.id);
+      if (dayIds.length > 0) {
+        await supabase
+          .from('fraud_alerts')
+          .update({
+            resolved: true,
+            resolved_at: new Date().toISOString(),
+            resolved_by: scannedBy ?? null,
+            note: `Résolue automatiquement : check-in de ${parsed.fullName} (PNR ${parsed.pnr}) sur ${flight.flight_number} postérieur au scan du bagage. L'étiquette est déclarée sur son boarding pass.`,
+          })
+          .in('flight_id', dayIds)
+          .eq('resolved', false)
+          .in(
+            'tag_number',
+            preRegistered.map((b) => b.tag_number),
+          );
+      }
     }
 
     return reply.send({
@@ -204,13 +344,27 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       .limit(1)
       .maybeSingle();
 
+    // Rien sur ce vol : on regarde ailleurs avant de conclure. Une étiquette
+    // trouvée sur un autre vol du jour est une erreur de tapis (règle 5, pas
+    // d'alerte) ; introuvable partout, elle est orpheline (règle 1) et on
+    // consigne d'où sort la série pour que le superviseur ait de quoi agir.
+    let linkedBag = (bagRow as LinkedBagRow | null) ?? null;
+    let tagNote: string | null = null;
+    if (!linkedBag) {
+      const elsewhere = await findTagOnOtherFlights(supabase, flightId, parsedTag);
+      linkedBag = elsewhere?.bag ?? null;
+      tagNote = elsewhere
+        ? `Étiquette enregistrée sur le vol ${elsewhere.flightNumber}, pas sur celui-ci.`
+        : await describeUnlinkedTag(supabase, flightId, parsedTag);
+    }
+
     let passenger: BaggageScanContext['passenger'] = null;
     let confirmedCount = 0;
-    if (bagRow) {
+    if (linkedBag) {
       const { data: pax } = await supabase
         .from('passengers')
         .select('id, full_name, pnr, flight_id, declared_baggage_count')
-        .eq('id', bagRow.passenger_id)
+        .eq('id', linkedBag.passenger_id)
         .single();
       if (pax) {
         passenger = {
@@ -233,12 +387,18 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       parsedTag,
       flightId,
       gate: gate ?? null,
-      registeredBag: bagRow
-        ? { id: bagRow.id, passengerId: bagRow.passenger_id, tagNumber: bagRow.tag_number, isConfirmed: bagRow.is_confirmed }
+      registeredBag: linkedBag
+        ? {
+            id: linkedBag.id,
+            passengerId: linkedBag.passenger_id,
+            tagNumber: linkedBag.tag_number,
+            isConfirmed: linkedBag.is_confirmed,
+          }
         : null,
       passenger,
       confirmedCountForPassenger: confirmedCount,
       duplicateConfirmedTag: Boolean(dupRow),
+      tagNote,
     });
 
     if (decision.confirmBagId) {
