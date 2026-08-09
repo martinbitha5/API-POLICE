@@ -3,6 +3,9 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { parseBoardingPass, parseBaggageTag } from '@police/bcbp-parser';
 import {
   flightNumbersMatch,
+  operationDenial,
+  type Flight,
+  type FlightOperation,
   type ParsedBaggageTag,
   type BoardingGateResult,
   type BaggageActionResult,
@@ -156,6 +159,40 @@ async function describeUnlinkedTag(
     : "Cette étiquette ne vient pas du comptoir de ce vol. Bagage probablement égaré, à mettre de côté.";
 }
 
+/**
+ * Refus de périmètre, ou null si l'agent est au bon bout de la ligne.
+ *
+ * La RLS garantit déjà qu'un agent ne voit que des vols touchant son aéroport ;
+ * ce contrôle-ci porte sur le rôle qu'il y joue : on ne prépare pas un départ
+ * depuis l'aéroport d'arrivée, et on ne réceptionne pas des bagages qui ne sont
+ * pas encore partis.
+ *
+ * Le contrôle vit ici et pas seulement dans le mobile : l'API tourne en
+ * service_role et contourne la RLS, donc masquer un bouton sur le PDA ne
+ * protège rien. Un PDA d'une version antérieure affichera encore l'écran, et
+ * c'est ce refus qui l'arrêtera.
+ *
+ * Vol introuvable, ou compte sans aéroport : on ne tranche pas. Les contrôles
+ * propres à chaque route font le reste, et une fiche de compte incomplète ne
+ * doit pas immobiliser un PDA en pleine rotation.
+ */
+async function stationDenial(
+  flightId: string | undefined,
+  airport: string | null,
+  operation: FlightOperation,
+): Promise<string | null> {
+  if (!flightId) return null;
+
+  const { data } = await getSupabase()
+    .from('flights')
+    .select('origin, destination, stops')
+    .eq('id', flightId)
+    .maybeSingle();
+
+  const flight = data as Pick<Flight, 'origin' | 'destination' | 'stops'> | null;
+  return flight ? operationDenial(operation, flight, airport) : null;
+}
+
 export async function scanRoutes(app: FastifyInstance): Promise<void> {
   // Toutes les routes de scan exigent un agent/superviseur/admin authentifié.
   // L'identité du scanneur est dérivée du JWT (request.authUserId), jamais du body.
@@ -167,6 +204,11 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: 'raw et flightId sont requis' });
+    }
+
+    const denial = await stationDenial(flightId, request.authAirport, 'checkin');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
 
     let parsed;
@@ -316,6 +358,11 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ error: 'tag et flightId sont requis' });
+    }
+
+    const denial = await stationDenial(flightId, request.authAirport, 'baggage');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
 
     let parsedTag;
@@ -506,6 +553,10 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
   // ── POST /scan/rush ─── Marquer un bagage pour réacheminement ─
   app.post<{ Body: BaggageActionBody }>('/scan/rush', async (request, reply) => {
+    const denial = await stationDenial(request.body.flightId, request.authAirport, 'rush');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
+    }
     const { code, result } = await markBaggage('rush', request.body, request.authUserId);
     return reply.code(code).send(result);
   });
@@ -520,6 +571,12 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     if (!flightId) {
       return reply.code(400).send({ status: 'rejected', message: 'flightId est requis' } satisfies BaggageLoadAllResult);
     }
+
+    const denial = await stationDenial(flightId, request.authAirport, 'charger');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
+    }
+
     const supabase = getSupabase();
 
     // État courant des bagages confirmés du vol.
@@ -567,6 +624,11 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     }
     if (soute !== 'avant' && soute !== 'arriere') {
       return reply.code(400).send({ status: 'rejected', message: 'soute doit être "avant" ou "arriere"' } satisfies BaggageActionResult);
+    }
+
+    const denial = await stationDenial(flightId, request.authAirport, 'soute');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
 
     let parsedTag;
@@ -633,6 +695,11 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ status: 'rejected', message: 'tag et flightId sont requis' } satisfies DollyScanResult);
+    }
+
+    const denial = await stationDenial(flightId, request.authAirport, 'dolly');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
 
     let parsedTag;
@@ -729,6 +796,11 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ status: 'rejected', message: 'tag et flightId sont requis' } satisfies ArrivalScanResult);
+    }
+
+    const denial = await stationDenial(flightId, request.authAirport, 'arrivee');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
 
     let parsedTag;
@@ -831,6 +903,11 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: 'raw et flightId sont requis' });
+    }
+
+    const denial = await stationDenial(flightId, request.authAirport, 'embarquement');
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
 
     let parsed;

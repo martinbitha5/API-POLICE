@@ -22,6 +22,12 @@ declare module 'fastify' {
     authUserId: string;
     /** Rôle du profil authentifié. */
     authRole: UserRole;
+    /**
+     * Aéroport d'affectation du profil. Détermine ce que l'agent peut faire sur
+     * un vol : préparer un départ, réceptionner une arrivée. Comme le rôle, il
+     * vient de la base, jamais du corps de la requête.
+     */
+    authAirport: string | null;
   }
 }
 
@@ -54,9 +60,9 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
 
   const { data: profile, error: profErr } = await supabase
     .from('profiles')
-    .select('role')
+    .select('role, airport_code')
     .eq('id', userData.user.id)
-    .single<{ role: UserRole }>();
+    .single<{ role: UserRole; airport_code: string | null }>();
 
   if (profErr || !profile) {
     await reply.code(403).send({ error: 'Profil introuvable' });
@@ -70,4 +76,5 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
 
   request.authUserId = userData.user.id;
   request.authRole = profile.role;
+  request.authAirport = profile.airport_code;
 }

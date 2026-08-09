@@ -110,6 +110,76 @@ var FRAUD_REASON = {
   WRONG_FLIGHT: "Bagage appartient \xE0 un autre vol"
 };
 
+// packages/shared/src/date.ts
+function isoDate(d) {
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+function todayLocal() {
+  return isoDate(/* @__PURE__ */ new Date());
+}
+function todayInTimeZone(timeZone) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(/* @__PURE__ */ new Date());
+    const get = (type) => parts.find((p) => p.type === type)?.value ?? "";
+    const y = get("year");
+    const m = get("month");
+    const d = get("day");
+    if (y.length === 4 && m.length === 2 && d.length === 2) return `${y}-${m}-${d}`;
+  } catch {
+  }
+  return todayLocal();
+}
+
+// packages/shared/src/airports.ts
+var DEFAULT_TIME_ZONE = "Africa/Kinshasa";
+var KIN = "Africa/Kinshasa";
+var LUB = "Africa/Lubumbashi";
+var AIRPORTS = [
+  // ── Lignes domestiques (RD Congo) ──────────────────────────
+  { code: "FIH", city: "Kinshasa", country: "RD Congo", domestic: true, timeZone: KIN },
+  { code: "MDK", city: "Mbandaka", country: "RD Congo", domestic: true, timeZone: KIN },
+  { code: "GMA", city: "Gemena", country: "RD Congo", domestic: true, timeZone: KIN },
+  { code: "BDT", city: "Gbadolite", country: "RD Congo", domestic: true, timeZone: KIN },
+  { code: "FBM", city: "Lubumbashi", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "GOM", city: "Goma", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "FKI", city: "Kisangani", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "KND", city: "Kindu", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "MJM", city: "Mbuji-Mayi", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "KGA", city: "Kananga", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "FMI", city: "Kalemie", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "BUX", city: "Bunia", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "BNC", city: "Beni", country: "RD Congo", domestic: true, timeZone: LUB },
+  { code: "IRP", city: "Isiro", country: "RD Congo", domestic: true, timeZone: LUB },
+  // ── Lignes internationales ─────────────────────────────────
+  { code: "JNB", city: "Johannesburg", country: "Afrique du Sud", domestic: false, timeZone: "Africa/Johannesburg" },
+  { code: "EBB", city: "Entebbe", country: "Ouganda", domestic: false, timeZone: "Africa/Kampala" },
+  { code: "DLA", city: "Douala", country: "Cameroun", domestic: false, timeZone: "Africa/Douala" },
+  { code: "COO", city: "Cotonou", country: "B\xE9nin", domestic: false, timeZone: "Africa/Porto-Novo" },
+  { code: "DAR", city: "Dar es Salaam", country: "Tanzanie", domestic: false, timeZone: "Africa/Dar_es_Salaam" },
+  { code: "BRU", city: "Bruxelles", country: "Belgique", domestic: false, timeZone: "Europe/Brussels" }
+];
+var BY_CODE = Object.fromEntries(AIRPORTS.map((a) => [a.code, a]));
+function findAirport(code) {
+  return BY_CODE[code.trim().toUpperCase()];
+}
+function airportLabel(code) {
+  const a = findAirport(code);
+  return a ? `${a.city} (${a.code})` : code;
+}
+function airportTimeZone(code) {
+  return findAirport(code ?? "")?.timeZone ?? DEFAULT_TIME_ZONE;
+}
+function todayAtAirport(code) {
+  return todayInTimeZone(airportTimeZone(code));
+}
+
 // packages/shared/src/flight.ts
 function splitFlightNumber(raw) {
   const cleaned = (raw ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -125,6 +195,37 @@ function flightNumbersMatch(a, b) {
   if (fa.number !== fb.number) return false;
   if (fa.carrier && fb.carrier) return fa.carrier === fb.carrier;
   return true;
+}
+function sameAirport(a, b) {
+  const na = (a ?? "").trim().toUpperCase();
+  return na.length > 0 && na === (b ?? "").trim().toUpperCase();
+}
+function stationRole(flight, airportCode) {
+  if (!(airportCode ?? "").trim()) return "unknown";
+  const isOrigin = sameAirport(airportCode, flight.origin);
+  const isDestination = sameAirport(airportCode, flight.destination);
+  const isStop = (flight.stops ?? []).some((s) => sameAirport(airportCode, s));
+  if (isStop || isOrigin && isDestination) return "stop";
+  if (isOrigin) return "origin";
+  if (isDestination) return "destination";
+  return "unknown";
+}
+function operationAllowed(operation, role) {
+  switch (role) {
+    case "origin":
+      return operation !== "arrivee";
+    case "destination":
+      return operation === "arrivee";
+    case "stop":
+      return true;
+    case "unknown":
+      return true;
+  }
+}
+function operationDenial(operation, flight, airportCode) {
+  const role = stationRole(flight, airportCode);
+  if (operationAllowed(operation, role)) return null;
+  return operation === "arrivee" ? `Ce vol part de ${airportLabel(flight.origin)}. Les bagages se r\xE9ceptionnent \xE0 ${airportLabel(flight.destination)}, \xE0 l'arriv\xE9e.` : `Ce vol arrive \xE0 ${airportLabel(flight.destination)}. Les op\xE9rations de d\xE9part se font \xE0 ${airportLabel(flight.origin)}.`;
 }
 
 // packages/api/src/supabase.ts
@@ -231,7 +332,7 @@ async function authenticate(request, reply) {
     await reply.code(401).send({ error: "Session invalide ou expir\xE9e" });
     return;
   }
-  const { data: profile, error: profErr } = await supabase.from("profiles").select("role").eq("id", userData.user.id).single();
+  const { data: profile, error: profErr } = await supabase.from("profiles").select("role, airport_code").eq("id", userData.user.id).single();
   if (profErr || !profile) {
     await reply.code(403).send({ error: "Profil introuvable" });
     return;
@@ -242,6 +343,7 @@ async function authenticate(request, reply) {
   }
   request.authUserId = userData.user.id;
   request.authRole = profile.role;
+  request.authAirport = profile.airport_code;
 }
 
 // packages/api/src/routes/scan.ts
@@ -276,6 +378,12 @@ async function describeUnlinkedTag(supabase, flightId, parsedTag) {
   }
   return serial >= lo && serial <= hi ? "\xC9tiquette imprim\xE9e au comptoir pour ce vol, mais aucun passager ne l'a d\xE9clar\xE9e. Faire intercepter le colis avant le chargement." : "Cette \xE9tiquette ne vient pas du comptoir de ce vol. Bagage probablement \xE9gar\xE9, \xE0 mettre de c\xF4t\xE9.";
 }
+async function stationDenial(flightId, airport, operation) {
+  if (!flightId) return null;
+  const { data } = await getSupabase().from("flights").select("origin, destination, stops").eq("id", flightId).maybeSingle();
+  const flight = data;
+  return flight ? operationDenial(operation, flight, airport) : null;
+}
 async function scanRoutes(app2) {
   app2.addHook("preHandler", authenticate);
   app2.post("/scan/boarding", async (request, reply) => {
@@ -283,6 +391,10 @@ async function scanRoutes(app2) {
     const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: "raw et flightId sont requis" });
+    }
+    const denial = await stationDenial(flightId, request.authAirport, "checkin");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
     let parsed;
     try {
@@ -381,6 +493,10 @@ async function scanRoutes(app2) {
     const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ error: "tag et flightId sont requis" });
+    }
+    const denial = await stationDenial(flightId, request.authAirport, "baggage");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
     let parsedTag;
     try {
@@ -481,6 +597,10 @@ async function scanRoutes(app2) {
     };
   }
   app2.post("/scan/rush", async (request, reply) => {
+    const denial = await stationDenial(request.body.flightId, request.authAirport, "rush");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
+    }
     const { code, result } = await markBaggage("rush", request.body, request.authUserId);
     return reply.code(code).send(result);
   });
@@ -489,6 +609,10 @@ async function scanRoutes(app2) {
     const scannedBy = request.authUserId;
     if (!flightId) {
       return reply.code(400).send({ status: "rejected", message: "flightId est requis" });
+    }
+    const denial = await stationDenial(flightId, request.authAirport, "charger");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
     const supabase = getSupabase();
     const { data: rows } = await supabase.from("baggage").select("id, in_hold, rush").eq("flight_id", flightId).eq("is_confirmed", true);
@@ -518,6 +642,10 @@ async function scanRoutes(app2) {
     }
     if (soute !== "avant" && soute !== "arriere") {
       return reply.code(400).send({ status: "rejected", message: 'soute doit \xEAtre "avant" ou "arriere"' });
+    }
+    const denial = await stationDenial(flightId, request.authAirport, "soute");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
     let parsedTag;
     try {
@@ -552,6 +680,10 @@ async function scanRoutes(app2) {
     const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
+    }
+    const denial = await stationDenial(flightId, request.authAirport, "dolly");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
     let parsedTag;
     try {
@@ -610,6 +742,10 @@ async function scanRoutes(app2) {
     const scannedBy = request.authUserId;
     if (!tag || !flightId) {
       return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
+    }
+    const denial = await stationDenial(flightId, request.authAirport, "arrivee");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
     }
     let parsedTag;
     try {
@@ -675,6 +811,10 @@ async function scanRoutes(app2) {
     if (!raw || !flightId) {
       return reply.code(400).send({ error: "raw et flightId sont requis" });
     }
+    const denial = await stationDenial(flightId, request.authAirport, "embarquement");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
+    }
     let parsed;
     try {
       parsed = parseBoardingPass(raw);
@@ -722,11 +862,22 @@ async function scanRoutes(app2) {
   });
 }
 
+// packages/api/src/routes/day.ts
+async function dayRoutes(app2) {
+  app2.addHook("preHandler", authenticate);
+  app2.get("/operating-day", async (request) => ({
+    airport: request.authAirport,
+    day: todayAtAirport(request.authAirport),
+    serverTime: (/* @__PURE__ */ new Date()).toISOString()
+  }));
+}
+
 // packages/api/src/server.ts
 function buildServer() {
   const app2 = Fastify({ logger: true });
   app2.get("/health", async () => ({ status: "ok" }));
   app2.register(scanRoutes);
+  app2.register(dayRoutes);
   return app2;
 }
 
