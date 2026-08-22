@@ -55,6 +55,7 @@ export type FlightOperation =
   | 'soute'
   | 'charger'
   | 'rush'
+  | 'expedition_rush'
   | 'embarquement'
   | 'arrivee';
 

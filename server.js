@@ -107,7 +107,11 @@ var FRAUD_REASON = {
   ZERO_DECLARED: "0 bagage d\xE9clar\xE9 sur boarding pass",
   QUOTA_EXCEEDED: "Quota bagage d\xE9pass\xE9",
   ALREADY_SCANNED: "Bagage d\xE9j\xE0 enregistr\xE9",
-  WRONG_FLIGHT: "Bagage appartient \xE0 un autre vol"
+  WRONG_FLIGHT: "Bagage appartient \xE0 un autre vol",
+  /** Rejets sans alerte fraude : décisions superviseur ou mauvais écran. */
+  CANCELLED: "Bagage annul\xE9 par le superviseur",
+  OFFLOADED: "Passager d\xE9barqu\xE9",
+  RUSH_FORWARD: "Bagage exp\xE9dition rush"
 };
 
 // packages/shared/src/date.ts
@@ -347,6 +351,9 @@ async function authenticate(request, reply) {
 }
 
 // packages/api/src/routes/scan.ts
+function eitherSerial(serials) {
+  return serials.flatMap((s) => [`serial_number.eq.${s}`, `rush_serial_number.eq.${s}`]).join(",");
+}
 async function findTagOnOtherFlights(supabase, flightId, parsedTag) {
   const { data: current } = await supabase.from("flights").select("date").eq("id", flightId).single();
   const date = current?.date;
@@ -359,7 +366,7 @@ async function findTagOnOtherFlights(supabase, flightId, parsedTag) {
   const { data: row } = await supabase.from("baggage").select("id, passenger_id, tag_number, is_confirmed, flight_id").in(
     "flight_id",
     others.map((f) => f.id)
-  ).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+  ).eq("kind", "passenger").eq("cancelled", false).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
   const bag = row;
   if (!bag) return null;
   return { bag, flightNumber: others.find((f) => f.id === bag.flight_id)?.flight_number ?? "inconnu" };
@@ -367,8 +374,8 @@ async function findTagOnOtherFlights(supabase, flightId, parsedTag) {
 async function describeUnlinkedTag(supabase, flightId, parsedTag) {
   const prefix = `${parsedTag.issuerCode}${parsedTag.airlineNumericCode}`;
   const [{ data: first }, { data: last }] = await Promise.all([
-    supabase.from("baggage").select("serial_number").eq("flight_id", flightId).like("tag_number", `${prefix}%`).order("serial_number", { ascending: true }).limit(1).maybeSingle(),
-    supabase.from("baggage").select("serial_number").eq("flight_id", flightId).like("tag_number", `${prefix}%`).order("serial_number", { ascending: false }).limit(1).maybeSingle()
+    supabase.from("baggage").select("serial_number").eq("flight_id", flightId).eq("kind", "passenger").like("tag_number", `${prefix}%`).order("serial_number", { ascending: true }).limit(1).maybeSingle(),
+    supabase.from("baggage").select("serial_number").eq("flight_id", flightId).eq("kind", "passenger").like("tag_number", `${prefix}%`).order("serial_number", { ascending: false }).limit(1).maybeSingle()
   ]);
   const serial = parsedTag.serialNumber;
   const lo = first?.serial_number ?? null;
@@ -505,8 +512,26 @@ async function scanRoutes(app2) {
       return reply.code(400).send({ error: e.message });
     }
     const supabase = getSupabase();
+    const { data: cancelledRow } = await supabase.from("baggage").select("id").eq("flight_id", flightId).eq("cancelled", true).or(eitherSerial([parsedTag.serialNumber])).limit(1).maybeSingle();
+    if (cancelledRow) {
+      return reply.send({
+        status: "rejected",
+        reason: FRAUD_REASON.CANCELLED,
+        fraudAlert: false,
+        message: "Bagage annul\xE9 par le superviseur. Mettez-le de c\xF4t\xE9."
+      });
+    }
+    const { data: fwdRow } = await supabase.from("baggage").select("id").eq("flight_id", flightId).eq("kind", "rush_forward").or(eitherSerial([parsedTag.serialNumber])).limit(1).maybeSingle();
+    if (fwdRow) {
+      return reply.send({
+        status: "rejected",
+        reason: FRAUD_REASON.RUSH_FORWARD,
+        fraudAlert: false,
+        message: "Bagage exp\xE9dition rush, sans passager sur ce vol. Il ne passe pas au tapis."
+      });
+    }
     const { data: dupRow } = await supabase.from("baggage").select("id").eq("flight_id", flightId).eq("tag_number", tag).eq("is_confirmed", true).maybeSingle();
-    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, tag_number, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: true }).limit(1).maybeSingle();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, tag_number, is_confirmed").eq("flight_id", flightId).eq("kind", "passenger").eq("cancelled", false).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: true }).limit(1).maybeSingle();
     let linkedBag = bagRow ?? null;
     let tagNote = null;
     if (!linkedBag) {
@@ -517,8 +542,16 @@ async function scanRoutes(app2) {
     let passenger = null;
     let confirmedCount = 0;
     if (linkedBag) {
-      const { data: pax } = await supabase.from("passengers").select("id, full_name, pnr, flight_id, declared_baggage_count").eq("id", linkedBag.passenger_id).single();
+      const { data: pax } = await supabase.from("passengers").select("id, full_name, pnr, flight_id, declared_baggage_count, offloaded").eq("id", linkedBag.passenger_id).single();
       if (pax) {
+        if (pax.offloaded) {
+          return reply.send({
+            status: "rejected",
+            reason: FRAUD_REASON.OFFLOADED,
+            fraudAlert: false,
+            message: `${pax.full_name} a \xE9t\xE9 d\xE9barqu\xE9 par le superviseur. Bagage non autoris\xE9, mettez-le de c\xF4t\xE9.`
+          });
+        }
         passenger = {
           id: pax.id,
           fullName: pax.full_name,
@@ -526,7 +559,7 @@ async function scanRoutes(app2) {
           flightId: pax.flight_id,
           declaredBaggageCount: pax.declared_baggage_count
         };
-        const { count } = await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", pax.id).eq("is_confirmed", true);
+        const { count } = await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", pax.id).eq("is_confirmed", true).eq("cancelled", false);
         confirmedCount = count ?? 0;
       }
     }
@@ -568,9 +601,15 @@ async function scanRoutes(app2) {
       return { code: 400, result: { status: "rejected", message: e.message } };
     }
     const supabase = getSupabase();
-    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, cancelled").eq("flight_id", flightId).eq("kind", "passenger").eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
     if (!bagRow) {
       return { code: 200, result: { status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol." } };
+    }
+    if (bagRow.cancelled) {
+      return {
+        code: 200,
+        result: { status: "rejected", message: "Bagage annul\xE9 par le superviseur. Mettez-le de c\xF4t\xE9." }
+      };
     }
     if (!bagRow.is_confirmed) {
       return {
@@ -582,7 +621,7 @@ async function scanRoutes(app2) {
     const patch = field === "in_hold" ? { in_hold: true, in_hold_at: stamp, in_hold_by: scannedBy ?? null } : { rush: true, rush_at: stamp, rush_by: scannedBy ?? null };
     await supabase.from("baggage").update({ ...patch, tag_number: tag }).eq("id", bagRow.id);
     const { data: pax } = await supabase.from("passengers").select("full_name, declared_baggage_count").eq("id", bagRow.passenger_id).single();
-    const { count } = await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", bagRow.passenger_id).eq(field, true);
+    const { count } = await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", bagRow.passenger_id).eq("cancelled", false).eq(field, true);
     const verb = field === "in_hold" ? "charg\xE9 en soute" : "marqu\xE9 pour r\xE9acheminement";
     return {
       code: 200,
@@ -604,6 +643,186 @@ async function scanRoutes(app2) {
     const { code, result } = await markBaggage("rush", request.body, request.authUserId);
     return reply.code(code).send(result);
   });
+  app2.post("/scan/expedition-rush", async (request, reply) => {
+    const { tag, otherTag, soloTag, flightId } = request.body;
+    const scannedBy = request.authUserId;
+    if (!tag || !flightId) {
+      return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
+    }
+    const denial = await stationDenial(flightId, request.authAirport, "expedition_rush");
+    if (denial) {
+      return reply.code(403).send({ error: denial });
+    }
+    let t1;
+    let t2 = null;
+    try {
+      t1 = parseBaggageTag(tag);
+      if (otherTag) t2 = parseBaggageTag(otherTag);
+    } catch (e) {
+      return reply.code(400).send({ status: "rejected", message: e.message });
+    }
+    if (t2 && t1.serialNumber === t2.serialNumber) {
+      return reply.send({
+        status: "rejected",
+        message: "M\xEAme \xE9tiquette scann\xE9e deux fois. Scannez l'AUTRE \xE9tiquette du bagage."
+      });
+    }
+    const supabase = getSupabase();
+    const { data: flight } = await supabase.from("flights").select("flight_number, date, origin").eq("id", flightId).single();
+    if (!flight) {
+      return reply.code(404).send({ status: "rejected", message: "Vol introuvable" });
+    }
+    const serials = t2 ? [t1.serialNumber, t2.serialNumber] : [t1.serialNumber];
+    const { data: announcedRow } = await supabase.from("baggage").select("id, tag_number, serial_number, rush_tag_number, rush_serial_number, announced_by, rush_origin, rush_owner_name").eq("flight_id", flightId).eq("kind", "rush_forward").eq("rush_status", "expected").or(eitherSerial(serials)).limit(1).maybeSingle();
+    if (announcedRow) {
+      const a = announcedRow;
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const knownSerials = [a.serial_number, a.rush_serial_number].filter(Boolean);
+      const fresh = [t1, ...t2 ? [t2] : []].find((p) => !knownSerials.includes(p.serialNumber));
+      const linkPatch = fresh && a.tag_number === a.rush_tag_number ? {
+        tag_number: fresh.rawTag,
+        serial_number: fresh.serialNumber,
+        issuer_code: fresh.issuerCode,
+        airline_numeric_code: fresh.airlineNumericCode
+      } : {};
+      await supabase.from("baggage").update({
+        rush_status: "approved",
+        rush_status_at: now,
+        rush_status_by: a.announced_by ?? null,
+        scanned_by: scannedBy ?? null,
+        scanned_at: now,
+        ...linkPatch
+      }).eq("id", a.id).eq("rush_status", "expected");
+      const who = a.rush_owner_name ? ` ${a.rush_owner_name},` : "";
+      const from = a.rush_origin ? ` ${a.rush_origin}.` : "";
+      return reply.send({
+        status: "accepted",
+        known: true,
+        validation: "approved",
+        passengerName: a.rush_owner_name,
+        originFlight: a.rush_origin,
+        tagNumber: linkPatch.tag_number ?? a.tag_number,
+        rushTagNumber: a.rush_tag_number ?? a.tag_number,
+        message: `Bagage annonc\xE9 par le superviseur :${who}${from} Autoris\xE9.`
+      });
+    }
+    const { data: existing } = await supabase.from("baggage").select("id, rush_status").eq("flight_id", flightId).eq("kind", "rush_forward").neq("rush_status", "expected").or(eitherSerial(serials)).limit(1).maybeSingle();
+    if (existing) {
+      const st = existing.rush_status;
+      return reply.send({
+        status: "rejected",
+        message: st === "pending" ? "Bagage d\xE9j\xE0 enregistr\xE9, en attente de validation du superviseur." : st === "denied" ? "Bagage refus\xE9 par le superviseur. Ne pas embarquer." : "Bagage d\xE9j\xE0 enregistr\xE9 et autoris\xE9. Passez au suivant."
+      });
+    }
+    const { data: ownBag } = await supabase.from("baggage").select("id").eq("flight_id", flightId).eq("kind", "passenger").eq("cancelled", false).in("serial_number", serials).limit(1).maybeSingle();
+    if (ownBag) {
+      return reply.send({
+        status: "rejected",
+        message: "Ce bagage appartient \xE0 un passager de ce vol. Passez-le au tapis, \xE9cran Bagages."
+      });
+    }
+    const norm = (v) => (v ?? "").trim().toUpperCase();
+    const airport = norm(request.authAirport) || norm(flight.origin);
+    const since = /* @__PURE__ */ new Date(`${flight.date}T00:00:00Z`);
+    since.setUTCDate(since.getUTCDate() - 7);
+    const sinceStr = since.toISOString().slice(0, 10);
+    const { data: recent } = await supabase.from("flights").select("id, flight_number, date, origin, stops").gte("date", sinceStr).lte("date", flight.date);
+    const candidates = (recent ?? []).filter(
+      (f) => f.id !== flightId && (norm(f.origin) === airport || (f.stops ?? []).some((s) => norm(s) === airport))
+    );
+    let known = null;
+    if (candidates.length > 0) {
+      const { data: rest } = await supabase.from("baggage").select("id, passenger_id, tag_number, serial_number, issuer_code, airline_numeric_code, flight_id").in(
+        "flight_id",
+        candidates.map((f) => f.id)
+      ).eq("kind", "passenger").eq("rush", true).eq("cancelled", false).in("serial_number", serials).order("rush_at", { ascending: false }).limit(1).maybeSingle();
+      const bag = rest;
+      if (bag) {
+        const { data: fwd } = await supabase.from("baggage").select("id").eq("kind", "rush_forward").eq("origin_baggage_id", bag.id).neq("rush_status", "denied").limit(1).maybeSingle();
+        if (fwd) {
+          return reply.send({
+            status: "rejected",
+            message: "Ce restant a d\xE9j\xE0 \xE9t\xE9 r\xE9achemin\xE9 sur un autre vol. V\xE9rifiez avec le superviseur."
+          });
+        }
+        const of = candidates.find((f) => f.id === bag.flight_id);
+        const { data: pax } = await supabase.from("passengers").select("full_name").eq("id", bag.passenger_id).single();
+        known = {
+          bag,
+          flightLabel: of ? `${of.flight_number} du ${of.date}` : "un vol pr\xE9c\xE9dent",
+          passengerName: pax?.full_name ?? "passager inconnu"
+        };
+      }
+    }
+    if (!t2 && !soloTag) {
+      if (known) {
+        return reply.send({
+          status: "lookup",
+          known: true,
+          passengerName: known.passengerName,
+          originFlight: known.flightLabel,
+          message: `Bagage de ${known.passengerName}, rest\xE9 du vol ${known.flightLabel}. Scannez maintenant l'\xE9tiquette RUSH pour la lier.`
+        });
+      }
+      return reply.send({
+        status: "lookup",
+        known: false,
+        passengerName: null,
+        originFlight: null,
+        message: "\xC9tiquette non reconnue. Scannez l'autre \xE9tiquette du bagage."
+      });
+    }
+    const original = known && t2 && known.bag.serial_number === t2.serialNumber ? t2 : t1;
+    const rushTag = t2 ? original === t1 ? t2 : t1 : t1;
+    const { error: insErr } = await supabase.from("baggage").insert({
+      flight_id: flightId,
+      kind: "rush_forward",
+      passenger_id: known?.bag.passenger_id ?? null,
+      tag_number: original.rawTag,
+      issuer_code: original.issuerCode,
+      airline_numeric_code: original.airlineNumericCode,
+      serial_number: original.serialNumber,
+      rush_tag_number: rushTag.rawTag,
+      rush_serial_number: rushTag.serialNumber,
+      origin_baggage_id: known?.bag.id ?? null,
+      rush_status: known ? "approved" : "pending",
+      rush_status_at: known ? (/* @__PURE__ */ new Date()).toISOString() : null,
+      is_confirmed: false,
+      scanned_by: scannedBy ?? null
+    });
+    if (insErr) {
+      if (insErr.code === "23505") {
+        return reply.send({
+          status: "rejected",
+          message: "Une ligne existe d\xE9j\xE0 pour cette \xE9tiquette sur ce vol. V\xE9rifiez avec le superviseur."
+        });
+      }
+      request.log.error(insErr);
+      return reply.code(500).send({ status: "rejected", message: "\xC9chec de l'enregistrement du bagage" });
+    }
+    if (known) {
+      return reply.send({
+        status: "accepted",
+        known: true,
+        validation: "approved",
+        passengerName: known.passengerName,
+        originFlight: known.flightLabel,
+        tagNumber: original.rawTag,
+        rushTagNumber: rushTag.rawTag,
+        message: `Bagage de ${known.passengerName}, rest\xE9 du vol ${known.flightLabel}. Rattach\xE9 \xE0 ce vol, \xE9tiquettes li\xE9es.`
+      });
+    }
+    return reply.send({
+      status: "accepted",
+      known: false,
+      validation: "pending",
+      passengerName: null,
+      originFlight: null,
+      tagNumber: original.rawTag,
+      rushTagNumber: rushTag.rawTag,
+      message: "Bagage inconnu enregistr\xE9. En attente de validation du superviseur avant chargement."
+    });
+  });
   app2.post("/scan/load-all", async (request, reply) => {
     const { flightId } = request.body;
     const scannedBy = request.authUserId;
@@ -615,8 +834,11 @@ async function scanRoutes(app2) {
       return reply.code(403).send({ error: denial });
     }
     const supabase = getSupabase();
-    const { data: rows } = await supabase.from("baggage").select("id, in_hold, rush").eq("flight_id", flightId).eq("is_confirmed", true);
-    const bags = rows ?? [];
+    const { data: rows } = await supabase.from("baggage").select("id, in_hold, rush, kind, rush_status, is_confirmed, cancelled").eq("flight_id", flightId);
+    const all = rows ?? [];
+    const bags = all.filter(
+      (b) => !b.cancelled && (b.kind === "rush_forward" ? b.rush_status === "approved" : b.is_confirmed)
+    );
     const confirmed = bags.length;
     const rushed = bags.filter((b) => b.rush).length;
     const alreadyLoaded = bags.filter((b) => b.in_hold && !b.rush).length;
@@ -654,21 +876,50 @@ async function scanRoutes(app2) {
       return reply.code(400).send({ status: "rejected", message: e.message });
     }
     const supabase = getSupabase();
-    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, kind, rush_status, cancelled, in_hold, pulled").eq("flight_id", flightId).or(eitherSerial([parsedTag.serialNumber])).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
     if (!bagRow) {
       return reply.send({ status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol." });
     }
-    if (!bagRow.is_confirmed) {
+    if (bagRow.cancelled) {
+      if (bagRow.in_hold && !bagRow.pulled) {
+        await supabase.from("baggage").update({ pulled: true, pulled_at: (/* @__PURE__ */ new Date()).toISOString(), pulled_by: scannedBy ?? null }).eq("id", bagRow.id);
+        return reply.send({
+          status: "accepted",
+          passengerName: "\u2014",
+          tagNumber: tag,
+          count: 0,
+          declaredCount: 0,
+          message: "Bagage annul\xE9 retir\xE9 de la soute. Mettez-le de c\xF4t\xE9."
+        });
+      }
+      return reply.send({
+        status: "rejected",
+        message: "Bagage annul\xE9 par le superviseur. Ne pas le charger."
+      });
+    }
+    if (bagRow.kind === "rush_forward") {
+      if (bagRow.rush_status !== "approved") {
+        return reply.send({
+          status: "rejected",
+          message: bagRow.rush_status === "expected" ? "Bagage rush annonc\xE9 mais pas encore enregistr\xE9. Passez-le d'abord \xE0 l'\xE9cran Exp\xE9dition rush." : bagRow.rush_status === "pending" ? "Bagage rush en attente de validation du superviseur. Ne pas le charger." : "Bagage rush refus\xE9 par le superviseur. Ne pas le charger."
+        });
+      }
+    } else if (!bagRow.is_confirmed) {
       return reply.send({ status: "rejected", message: "Ce bagage n'est pas encore pass\xE9 au tapis. Enregistrez-le d'abord." });
     }
     const stamp = (/* @__PURE__ */ new Date()).toISOString();
-    await supabase.from("baggage").update({ soute, soute_at: stamp, soute_by: scannedBy ?? null, tag_number: tag }).eq("id", bagRow.id);
-    const { data: pax } = await supabase.from("passengers").select("full_name, declared_baggage_count").eq("id", bagRow.passenger_id).single();
-    const { count } = await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", bagRow.passenger_id).eq("soute", soute);
+    await supabase.from("baggage").update({
+      soute,
+      soute_at: stamp,
+      soute_by: scannedBy ?? null,
+      ...bagRow.kind === "passenger" ? { tag_number: tag } : {}
+    }).eq("id", bagRow.id);
+    const { data: pax } = bagRow.passenger_id ? await supabase.from("passengers").select("full_name, declared_baggage_count").eq("id", bagRow.passenger_id).single() : { data: null };
+    const { count } = bagRow.passenger_id ? await supabase.from("baggage").select("id", { count: "exact", head: true }).eq("passenger_id", bagRow.passenger_id).eq("cancelled", false).eq("soute", soute) : { count: 1 };
     const souteLabel = soute === "avant" ? "soute avant" : "soute arri\xE8re";
     return reply.send({
       status: "accepted",
-      passengerName: pax?.full_name ?? "\u2014",
+      passengerName: pax?.full_name ?? (bagRow.kind === "rush_forward" ? "Bagage rush (sans passager)" : "\u2014"),
       tagNumber: tag,
       count: count ?? 0,
       declaredCount: pax?.declared_baggage_count ?? 0,
@@ -692,29 +943,56 @@ async function scanRoutes(app2) {
       return reply.code(400).send({ status: "rejected", message: e.message });
     }
     const supabase = getSupabase();
-    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, on_dolly").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, on_dolly, kind, rush_status, cancelled").eq("flight_id", flightId).or(eitherSerial([parsedTag.serialNumber])).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
     async function progress() {
-      const [{ count: onDolly2 }, { count: confirmed2 }] = await Promise.all([
-        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("on_dolly", true),
-        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("is_confirmed", true)
+      const [{ count: onDolly2 }, { count: paxBags }, { count: rushBags }] = await Promise.all([
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("on_dolly", true).eq("cancelled", false),
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("kind", "passenger").eq("is_confirmed", true).eq("cancelled", false),
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("kind", "rush_forward").eq("rush_status", "approved")
       ]);
-      return { onDolly: onDolly2 ?? 0, confirmed: confirmed2 ?? 0 };
+      return { onDolly: onDolly2 ?? 0, confirmed: (paxBags ?? 0) + (rushBags ?? 0) };
     }
     if (!bagRow) {
       return reply.send({ status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol. Ne pas le charger." });
     }
-    if (!bagRow.is_confirmed) {
+    if (bagRow.cancelled) {
+      return reply.send({
+        status: "rejected",
+        message: "Bagage annul\xE9 par le superviseur. Ne pas le charger."
+      });
+    }
+    if (bagRow.kind === "rush_forward") {
+      if (bagRow.rush_status === "expected") {
+        return reply.send({
+          status: "rejected",
+          message: "Bagage rush annonc\xE9 mais pas encore enregistr\xE9. Passez-le d'abord \xE0 l'\xE9cran Exp\xE9dition rush."
+        });
+      }
+      if (bagRow.rush_status === "pending") {
+        return reply.send({
+          status: "rejected",
+          message: "Bagage rush en attente de validation du superviseur. Ne pas le charger."
+        });
+      }
+      if (bagRow.rush_status !== "approved") {
+        return reply.send({
+          status: "rejected",
+          message: "Bagage rush refus\xE9 par le superviseur. Ne pas le charger."
+        });
+      }
+    } else if (!bagRow.is_confirmed) {
       return reply.send({
         status: "rejected",
         message: "Ce bagage n'est pas pass\xE9 au tapis. Ne pas le charger."
       });
     }
-    const { data: pax } = await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single();
+    const { data: pax } = bagRow.passenger_id ? await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single() : { data: null };
+    const displayName = pax?.full_name ?? (bagRow.kind === "rush_forward" ? "Bagage rush (sans passager)" : "\u2014");
     if (bagRow.on_dolly) {
       const { onDolly: onDolly2, confirmed: confirmed2 } = await progress();
       return reply.send({
         status: "accepted",
-        passengerName: pax?.full_name ?? "\u2014",
+        passengerName: displayName,
         tagNumber: tag,
         onDolly: onDolly2,
         confirmed: confirmed2,
@@ -723,12 +1001,17 @@ async function scanRoutes(app2) {
         message: "D\xE9j\xE0 sur le dolly."
       });
     }
-    await supabase.from("baggage").update({ on_dolly: true, on_dolly_at: (/* @__PURE__ */ new Date()).toISOString(), on_dolly_by: scannedBy, tag_number: tag }).eq("id", bagRow.id);
+    await supabase.from("baggage").update({
+      on_dolly: true,
+      on_dolly_at: (/* @__PURE__ */ new Date()).toISOString(),
+      on_dolly_by: scannedBy,
+      ...bagRow.kind === "passenger" ? { tag_number: tag } : {}
+    }).eq("id", bagRow.id);
     const { onDolly, confirmed } = await progress();
     const complete = onDolly >= confirmed && confirmed > 0;
     return reply.send({
       status: "accepted",
-      passengerName: pax?.full_name ?? "\u2014",
+      passengerName: displayName,
       tagNumber: tag,
       onDolly,
       confirmed,
@@ -754,16 +1037,22 @@ async function scanRoutes(app2) {
       return reply.code(400).send({ status: "rejected", message: e.message });
     }
     const supabase = getSupabase();
-    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, in_hold, rush, arrived").eq("flight_id", flightId).eq("serial_number", parsedTag.serialNumber).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
+    const { data: bagRow } = await supabase.from("baggage").select("id, passenger_id, is_confirmed, in_hold, rush, arrived, kind, cancelled").eq("flight_id", flightId).or(eitherSerial([parsedTag.serialNumber])).order("is_confirmed", { ascending: false }).limit(1).maybeSingle();
     async function progress() {
       const [{ count: arrived2 }, { count: expected2 }] = await Promise.all([
-        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("arrived", true),
-        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("in_hold", true).eq("rush", false)
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("arrived", true).eq("cancelled", false),
+        supabase.from("baggage").select("id", { count: "exact", head: true }).eq("flight_id", flightId).eq("in_hold", true).eq("rush", false).eq("cancelled", false)
       ]);
       return { arrived: arrived2 ?? 0, expected: expected2 ?? 0 };
     }
     if (!bagRow) {
       return reply.send({ status: "rejected", message: "Ce bagage n'appartient pas \xE0 ce vol." });
+    }
+    if (bagRow.cancelled) {
+      return reply.send({
+        status: "rejected",
+        message: "Ce bagage a \xE9t\xE9 annul\xE9 au d\xE9part et aurait d\xFB \xEAtre retir\xE9 de la soute. Pr\xE9venez le superviseur."
+      });
     }
     if (bagRow.rush) {
       return reply.send({
@@ -777,12 +1066,13 @@ async function scanRoutes(app2) {
         message: "Ce bagage n'a pas \xE9t\xE9 charg\xE9 sur ce vol, il n'aurait pas d\xFB voyager. Pr\xE9venez le superviseur."
       });
     }
-    const { data: pax } = await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single();
+    const { data: pax } = bagRow.passenger_id ? await supabase.from("passengers").select("full_name").eq("id", bagRow.passenger_id).single() : { data: null };
+    const displayName = pax?.full_name ?? (bagRow.kind === "rush_forward" ? "Bagage rush (sans passager)" : "\u2014");
     if (bagRow.arrived) {
       const { arrived: arrived2, expected: expected2 } = await progress();
       return reply.send({
         status: "accepted",
-        passengerName: pax?.full_name ?? "\u2014",
+        passengerName: displayName,
         tagNumber: tag,
         arrived: arrived2,
         expected: expected2,
@@ -791,18 +1081,23 @@ async function scanRoutes(app2) {
         message: "Bagage d\xE9j\xE0 r\xE9ceptionn\xE9."
       });
     }
-    await supabase.from("baggage").update({ arrived: true, arrived_at: (/* @__PURE__ */ new Date()).toISOString(), arrived_by: scannedBy, tag_number: tag }).eq("id", bagRow.id);
+    await supabase.from("baggage").update({
+      arrived: true,
+      arrived_at: (/* @__PURE__ */ new Date()).toISOString(),
+      arrived_by: scannedBy,
+      ...bagRow.kind === "passenger" ? { tag_number: tag } : {}
+    }).eq("id", bagRow.id);
     const { arrived, expected } = await progress();
     const complete = arrived >= expected && expected > 0;
     return reply.send({
       status: "accepted",
-      passengerName: pax?.full_name ?? "\u2014",
+      passengerName: displayName,
       tagNumber: tag,
       arrived,
       expected,
       alreadyArrived: false,
       complete,
-      message: complete ? "R\xE9ception compl\xE8te, tous les bagages charg\xE9s sont arriv\xE9s." : "Bagage r\xE9ceptionn\xE9 \xE0 destination."
+      message: bagRow.kind === "rush_forward" ? "Bagage rush sans passager \xE0 bord. Remettez-le au service bagages pour restitution." : complete ? "R\xE9ception compl\xE8te, tous les bagages charg\xE9s sont arriv\xE9s." : "Bagage r\xE9ceptionn\xE9 \xE0 destination."
     });
   });
   app2.post("/scan/embarquement", async (request, reply) => {
@@ -833,11 +1128,18 @@ async function scanRoutes(app2) {
       };
       return reply.send(result2);
     }
-    const { data: passenger } = await supabase.from("passengers").select("id, full_name, seat, boarded").eq("flight_id", flightId).eq("pnr", parsed.pnr).eq("seat", parsed.seat).maybeSingle();
+    const { data: passenger } = await supabase.from("passengers").select("id, full_name, seat, boarded, offloaded").eq("flight_id", flightId).eq("pnr", parsed.pnr).eq("seat", parsed.seat).maybeSingle();
     if (!passenger) {
       const result2 = {
         status: "rejected",
         message: "Ce passager n'a pas encore fait son check-in. Envoyez-le au comptoir."
+      };
+      return reply.send(result2);
+    }
+    if (passenger.offloaded) {
+      const result2 = {
+        status: "rejected",
+        message: `${passenger.full_name} a \xE9t\xE9 d\xE9barqu\xE9 par le superviseur. Ne pas embarquer.`
       };
       return reply.send(result2);
     }

@@ -81,6 +81,7 @@ describe('operationAllowed', () => {
   it("au départ : tout sauf l'arrivée", () => {
     expect(operationAllowed('checkin', 'origin')).toBe(true);
     expect(operationAllowed('rush', 'origin')).toBe(true);
+    expect(operationAllowed('expedition_rush', 'origin')).toBe(true);
     expect(operationAllowed('arrivee', 'origin')).toBe(false);
   });
 
@@ -88,6 +89,7 @@ describe('operationAllowed', () => {
     expect(operationAllowed('arrivee', 'destination')).toBe(true);
     expect(operationAllowed('checkin', 'destination')).toBe(false);
     expect(operationAllowed('rush', 'destination')).toBe(false);
+    expect(operationAllowed('expedition_rush', 'destination')).toBe(false);
   });
 
   it('à une escale : tout', () => {

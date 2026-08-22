@@ -25,6 +25,31 @@ export const FLIGHT_STATUS_LABEL: Record<FlightStatus, string> = {
   cancelled: 'Annulé',
 } as const;
 
+/**
+ * Famille d'une ligne baggage :
+ *  • passenger    : bagage d'un passager du vol (réconciliation tapis, règles anti-fraude).
+ *  • rush_forward : bagage expédié SANS passager sur ce vol (écran Expédition rush).
+ */
+export type BaggageKind = 'passenger' | 'rush_forward';
+
+/**
+ * Validation d'un bagage expédié (rush_forward uniquement) :
+ *  • expected : annoncé par le superviseur, pas encore arrivé au scan.
+ *    L'annonce vaut validation anticipée : le scan le passera à approved.
+ *  • approved : peut embarquer — annoncé, restant connu chez nous, ou décision
+ *    du superviseur pour un bagage externe arrivé sans annonce.
+ *  • pending  : bagage externe en attente de décision — le dolly le refuse.
+ *  • denied   : refusé par le superviseur (ou annonce annulée).
+ */
+export type RushValidationStatus = 'expected' | 'pending' | 'approved' | 'denied';
+
+export const RUSH_VALIDATION_LABEL: Record<RushValidationStatus, string> = {
+  expected: "Annoncé, en attente d'arrivée",
+  pending: 'En attente de validation',
+  approved: 'Autorisé',
+  denied: 'Refusé',
+} as const;
+
 /** Statut d'un dossier de litige bagage. */
 export type DisputeStatus = 'open' | 'investigating' | 'resolved';
 
@@ -51,6 +76,10 @@ export const FRAUD_REASON = {
   QUOTA_EXCEEDED: 'Quota bagage dépassé',
   ALREADY_SCANNED: 'Bagage déjà enregistré',
   WRONG_FLIGHT: 'Bagage appartient à un autre vol',
+  /** Rejets sans alerte fraude : décisions superviseur ou mauvais écran. */
+  CANCELLED: 'Bagage annulé par le superviseur',
+  OFFLOADED: 'Passager débarqué',
+  RUSH_FORWARD: 'Bagage expédition rush',
 } as const;
 
 export type FraudReason = (typeof FRAUD_REASON)[keyof typeof FRAUD_REASON];
@@ -145,6 +174,11 @@ export interface Passenger {
   boarded: boolean;
   boarded_at: string | null;
   boarded_by: string | null;
+  /** true = passager débarqué par le superviseur. Ses bagages sont annulés. */
+  offloaded: boolean;
+  offloaded_at: string | null;
+  offloaded_by: string | null;
+  offload_reason: string | null;
 }
 
 export interface PassengerLeg {
@@ -158,7 +192,11 @@ export interface PassengerLeg {
 
 export interface Baggage {
   id: string;
-  passenger_id: string;
+  /**
+   * Passager du vol pour un bagage `passenger`. Pour un `rush_forward` : le
+   * passager du vol D'ORIGINE si le bagage vient d'un restant connu, sinon null.
+   */
+  passenger_id: string | null;
   flight_id: string;
   tag_number: string;
   issuer_code: string | null;
@@ -187,6 +225,34 @@ export interface Baggage {
   arrived_by: string | null;
   scanned_at: string;
   scanned_by: string | null;
+  /** Famille de la ligne : bagage passager ou expédition rush (sans passager). */
+  kind: BaggageKind;
+  /** Deuxième étiquette physique (RUSH) d'un bagage expédié, sinon null. */
+  rush_tag_number: string | null;
+  rush_serial_number: string | null;
+  /** Ligne d'origine (le restant) quand le bagage expédié est connu chez nous. */
+  origin_baggage_id: string | null;
+  /** Validation d'un bagage expédié. null pour un bagage passager. */
+  rush_status: RushValidationStatus | null;
+  rush_status_at: string | null;
+  rush_status_by: string | null;
+  /** Annonce superviseur (rush_forward) : saisie avant l'arrivée du colis. */
+  announced_at: string | null;
+  announced_by: string | null;
+  /** Provenance saisie par le superviseur ("Air Congo, arrivé de GMA"). */
+  rush_origin: string | null;
+  /** Propriétaire saisi par le superviseur (bagage externe, hors base). */
+  rush_owner_name: string | null;
+  rush_note: string | null;
+  /** true = bagage annulé par le superviseur (ou passager débarqué). */
+  cancelled: boolean;
+  cancelled_at: string | null;
+  cancelled_by: string | null;
+  cancel_reason: string | null;
+  /** true = bagage annulé retiré de la soute, confirmé par scan. */
+  pulled: boolean;
+  pulled_at: string | null;
+  pulled_by: string | null;
 }
 
 export interface FraudAlert {
@@ -274,6 +340,43 @@ export interface BaggageActionRejected {
 }
 
 export type BaggageActionResult = BaggageActionAccepted | BaggageActionRejected;
+
+// ─────────────────────────────────────────────────────────────
+// Expédition rush : bagage voyageant sans passager sur le vol.
+// Flux à deux scans : le bagage porte son étiquette d'origine ET l'étiquette
+// RUSH imprimée au réacheminement. L'agent scanne les deux, dans n'importe
+// quel ordre ; le premier appel (sans otherTag) identifie, le second enregistre.
+// ─────────────────────────────────────────────────────────────
+
+/** Réponse au premier scan : le système dit ce qu'il a reconnu et attend l'autre étiquette. */
+export interface ExpeditionRushLookup {
+  status: 'lookup';
+  /** true = l'étiquette correspond à un restant connu chez nous. */
+  known: boolean;
+  passengerName: string | null;
+  /** Vol d'origine du restant connu (ex: "ET0062 du 2026-08-21"). */
+  originFlight: string | null;
+  message: string;
+}
+
+export interface ExpeditionRushAccepted {
+  status: 'accepted';
+  known: boolean;
+  /** approved = peut embarquer ; pending = attente de validation superviseur. */
+  validation: RushValidationStatus;
+  passengerName: string | null;
+  originFlight: string | null;
+  tagNumber: string;
+  rushTagNumber: string;
+  message: string;
+}
+
+export interface ExpeditionRushRejected {
+  status: 'rejected';
+  message: string;
+}
+
+export type ExpeditionRushResult = ExpeditionRushLookup | ExpeditionRushAccepted | ExpeditionRushRejected;
 
 /**
  * Chargement groupé en soute (fonction « Charger ») : pas de scan, on pousse
@@ -457,3 +560,128 @@ export interface BaggageClaimRejected {
 }
 
 export type BaggageClaimResult = BaggageClaimAccepted | BaggageClaimRejected;
+
+// ─────────────────────────────────────────────────────────────
+// Journal d'audit (vue `movement_log`, réservée aux admins)
+// ─────────────────────────────────────────────────────────────
+
+/** Nature d'un mouvement enregistré par le système. */
+export type MovementKind =
+  | 'passenger_checkin'
+  | 'passenger_boarded'
+  | 'passenger_offloaded'
+  | 'baggage_declared'
+  | 'baggage_belt'
+  | 'rush_announced'
+  | 'baggage_rush_in'
+  | 'rush_approved'
+  | 'rush_denied'
+  | 'baggage_cancelled'
+  | 'baggage_pulled'
+  | 'baggage_dolly'
+  | 'baggage_soute'
+  | 'baggage_hold'
+  | 'baggage_rush'
+  | 'baggage_arrived'
+  | 'fraud_opened'
+  | 'fraud_resolved'
+  | 'dispute_opened'
+  | 'dispute_resolved';
+
+/** Ordre d'affichage dans le filtre : le parcours réel, du check-in à l'arrivée. */
+export const MOVEMENT_ORDER: MovementKind[] = [
+  'passenger_checkin',
+  'passenger_boarded',
+  'passenger_offloaded',
+  'baggage_declared',
+  'baggage_belt',
+  'rush_announced',
+  'baggage_rush_in',
+  'rush_approved',
+  'rush_denied',
+  'baggage_cancelled',
+  'baggage_pulled',
+  'baggage_dolly',
+  'baggage_soute',
+  'baggage_hold',
+  'baggage_rush',
+  'baggage_arrived',
+  'fraud_opened',
+  'fraud_resolved',
+  'dispute_opened',
+  'dispute_resolved',
+];
+
+export const MOVEMENT_LABEL: Record<MovementKind, string> = {
+  passenger_checkin: 'Passager enregistré',
+  passenger_boarded: 'Passager embarqué',
+  passenger_offloaded: 'Passager débarqué',
+  baggage_declared: 'Bagage déclaré au check-in',
+  baggage_belt: 'Bagage enregistré au tapis',
+  rush_announced: 'Bagage rush annoncé par le superviseur',
+  baggage_rush_in: 'Bagage expédié (rush) enregistré',
+  rush_approved: 'Expédition rush autorisée',
+  rush_denied: 'Expédition rush refusée',
+  baggage_cancelled: 'Bagage annulé',
+  baggage_pulled: 'Bagage retiré de la soute',
+  baggage_dolly: 'Bagage contrôlé au rayon X',
+  baggage_soute: 'Bagage affecté en soute',
+  baggage_hold: 'Bagage chargé en soute',
+  baggage_rush: 'Bagage restant (à réacheminer)',
+  baggage_arrived: 'Bagage arrivé à destination',
+  fraud_opened: 'Alerte fraude levée',
+  fraud_resolved: 'Alerte fraude résolue',
+  dispute_opened: 'Litige ouvert',
+  dispute_resolved: 'Litige résolu',
+} as const;
+
+/** Famille d'un mouvement, pour le regroupement visuel. */
+export type MovementFamily = 'passenger' | 'baggage' | 'fraud' | 'dispute';
+
+export const MOVEMENT_FAMILY: Record<MovementKind, MovementFamily> = {
+  passenger_checkin: 'passenger',
+  passenger_boarded: 'passenger',
+  passenger_offloaded: 'passenger',
+  baggage_declared: 'baggage',
+  baggage_belt: 'baggage',
+  rush_announced: 'baggage',
+  baggage_rush_in: 'baggage',
+  rush_approved: 'baggage',
+  rush_denied: 'baggage',
+  baggage_cancelled: 'baggage',
+  baggage_pulled: 'baggage',
+  baggage_dolly: 'baggage',
+  baggage_soute: 'baggage',
+  baggage_hold: 'baggage',
+  baggage_rush: 'baggage',
+  baggage_arrived: 'baggage',
+  fraud_opened: 'fraud',
+  fraud_resolved: 'fraud',
+  dispute_opened: 'dispute',
+  dispute_resolved: 'dispute',
+} as const;
+
+/**
+ * Une ligne du journal d'audit.
+ *
+ * `actor_id` est nul pour les alertes fraude : elles sont levées par les règles
+ * anti-fraude, pas par un agent. Voir la vue `movement_log`.
+ */
+export interface Movement {
+  at: string;
+  kind: MovementKind;
+  actor_id: string | null;
+  actor_name: string | null;
+  actor_role: string | null;
+  flight_id: string | null;
+  flight_number: string | null;
+  flight_date: string | null;
+  origin: string | null;
+  destination: string | null;
+  passenger_id: string | null;
+  passenger_name: string | null;
+  pnr: string | null;
+  baggage_id: string | null;
+  tag_number: string | null;
+  detail: string | null;
+}
