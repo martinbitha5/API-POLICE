@@ -94,24 +94,24 @@ function extractBaggageTags(parsed) {
 // packages/shared/src/types.ts
 var FRAUD_REASON = {
   /**
-   * Règle 1 — l'étiquette ne correspond à aucun bagage déclaré sur un boarding
-   * pass de ce vol. On ne sait pas à qui elle appartient : le libellé décrit ce
-   * qu'on constate (une étiquette orpheline), pas une conclusion sur le passager.
+   * RÃ¨gle 1 â€” l'Ã©tiquette ne correspond Ã  aucun bagage dÃ©clarÃ© sur un boarding
+   * pass de ce vol. On ne sait pas Ã  qui elle appartient : le libellÃ© dÃ©crit ce
+   * qu'on constate (une Ã©tiquette orpheline), pas une conclusion sur le passager.
    */
-  UNLINKED_TAG: "\xC9tiquette non rattach\xE9e \xE0 un passager",
+  UNLINKED_TAG: "\xC3\u2030tiquette non rattach\xC3\xA9e \xC3\xA0 un passager",
   /**
-   * @deprecated Ancien libellé de la règle 1, conservé pour les alertes
-   * historiques déjà en base. Ne plus émettre : voir UNLINKED_TAG.
+   * @deprecated Ancien libellÃ© de la rÃ¨gle 1, conservÃ© pour les alertes
+   * historiques dÃ©jÃ  en base. Ne plus Ã©mettre : voir UNLINKED_TAG.
    */
-  PASSENGER_NOT_REGISTERED: "Passager non enregistr\xE9",
-  ZERO_DECLARED: "0 bagage d\xE9clar\xE9 sur boarding pass",
-  QUOTA_EXCEEDED: "Quota bagage d\xE9pass\xE9",
-  ALREADY_SCANNED: "Bagage d\xE9j\xE0 enregistr\xE9",
-  WRONG_FLIGHT: "Bagage appartient \xE0 un autre vol",
-  /** Rejets sans alerte fraude : décisions superviseur ou mauvais écran. */
-  CANCELLED: "Bagage annul\xE9 par le superviseur",
-  OFFLOADED: "Passager d\xE9barqu\xE9",
-  RUSH_FORWARD: "Bagage exp\xE9dition rush"
+  PASSENGER_NOT_REGISTERED: "Passager non enregistr\xC3\xA9",
+  ZERO_DECLARED: "0 bagage d\xC3\xA9clar\xC3\xA9 sur boarding pass",
+  QUOTA_EXCEEDED: "Quota bagage d\xC3\xA9pass\xC3\xA9",
+  ALREADY_SCANNED: "Bagage d\xC3\xA9j\xC3\xA0 enregistr\xC3\xA9",
+  WRONG_FLIGHT: "Bagage appartient \xC3\xA0 un autre vol",
+  /** Rejets sans alerte fraude : dÃ©cisions superviseur ou mauvais Ã©cran. */
+  CANCELLED: "Bagage annul\xC3\xA9 par le superviseur",
+  OFFLOADED: "Passager d\xC3\xA9barqu\xC3\xA9",
+  RUSH_FORWARD: "Bagage exp\xC3\xA9dition rush"
 };
 
 // packages/shared/src/date.ts
