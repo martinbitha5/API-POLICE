@@ -190,6 +190,12 @@ export interface Profile {
   gate: string | null;
   airport_code: string | null;
   airline_code: string | null;
+  /**
+   * Matricule lisible, attribué à la création et jamais modifié : « ET-014 ».
+   * Code IATA de la compagnie, tiret, numéro séquentiel dans cette compagnie.
+   * C'est lui qu'on affiche et qu'on dicte, pas l'UUID `id`.
+   */
+  staff_code: string | null;
   created_at: string;
 }
 
