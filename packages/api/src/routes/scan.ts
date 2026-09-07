@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { parseBoardingPass, parseBaggageTag } from '@police/bcbp-parser';
 import {
@@ -19,6 +19,7 @@ import {
 import { getSupabase } from '../supabase.js';
 import { evaluateBaggageScan, type BaggageScanContext } from '../fraud.js';
 import { authenticate } from '../auth.js';
+import { rateLimitPerUser } from '../rateLimit.js';
 
 interface BoardingBody {
   raw: string;
@@ -211,25 +212,73 @@ async function describeUnlinkedTag(
  */
 async function stationDenial(
   flightId: string | undefined,
-  airport: string | null,
+  request: Pick<FastifyRequest, 'authAirport' | 'authAirline'>,
   operation: FlightOperation,
 ): Promise<string | null> {
   if (!flightId) return null;
 
+  const airport = request.authAirport;
+  const airline = request.authAirline;
+
+  // M-05 : fail-closed. Un compte sans aéroport d'affectation ne peut effectuer
+  // aucune opération de scan (avant, un profil incomplet passait tous les contrôles).
+  if (!airport) {
+    return "Compte sans aéroport d'affectation. Contactez un administrateur.";
+  }
+
   const { data } = await getSupabase()
     .from('flights')
-    .select('origin, destination, stops')
+    .select('origin, destination, stops, airline_code')
     .eq('id', flightId)
     .maybeSingle();
 
-  const flight = data as Pick<Flight, 'origin' | 'destination' | 'stops'> | null;
-  return flight ? operationDenial(operation, flight, airport) : null;
+  const flight = data as
+    | (Pick<Flight, 'origin' | 'destination' | 'stops'> & { airline_code: string | null })
+    | null;
+  // Vol introuvable : la route fait son propre 404, on ne tranche pas ici.
+  if (!flight) return null;
+
+  // E-03 : cloisonnement par compagnie sur le chemin API. L'API tourne en
+  // service_role et contourne la RLS ; sans ce contrôle, un agent d'une compagnie
+  // pourrait opérer sur un vol d'une autre compagnie au même aéroport.
+  if (flight.airline_code && airline && flight.airline_code !== airline) {
+    return "Ce vol n'appartient pas à votre compagnie.";
+  }
+
+  return operationDenial(operation, flight, airport);
+}
+
+// M-04 : validation d'entrée commune à toutes les routes de scan. flightId doit
+// être un UUID ; les champs texte sont bornés (le bodyLimit global cape déjà le
+// corps, ceci cape chaque champ). Empêche les entrées démesurées ou malformées
+// d'atteindre les parsers et la base.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function validateScanBody(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const b = request.body as Record<string, unknown> | undefined;
+  if (!b || typeof b !== 'object') return;
+
+  if (b.flightId !== undefined && (typeof b.flightId !== 'string' || !UUID_RE.test(b.flightId))) {
+    await reply.code(400).send({ error: 'flightId invalide' });
+    return;
+  }
+
+  const okStr = (v: unknown, max: number): boolean =>
+    v === undefined || v === null || (typeof v === 'string' && v.length <= max);
+  if (!okStr(b.raw, 4096) || !okStr(b.tag, 32) || !okStr(b.otherTag, 32) || !okStr(b.gate, 64)) {
+    await reply.code(400).send({ error: 'Champ trop long ou invalide' });
+    return;
+  }
 }
 
 export async function scanRoutes(app: FastifyInstance): Promise<void> {
   // Toutes les routes de scan exigent un agent/superviseur/admin authentifié.
   // L'identité du scanneur est dérivée du JWT (request.authUserId), jamais du body.
   app.addHook('preHandler', authenticate);
+  // E-08 : limitation de débit par agent (après authenticate, qui pose authUserId).
+  app.addHook('preHandler', rateLimitPerUser);
+  // M-04 : validation d'entrée.
+  app.addHook('preHandler', validateScanBody);
 
   // ── POST /scan/boarding ─────────────────────────────────────
   app.post<{ Body: BoardingBody }>('/scan/boarding', async (request, reply) => {
@@ -239,7 +288,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'raw et flightId sont requis' });
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'checkin');
+    const denial = await stationDenial(flightId, request, 'checkin');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -393,7 +442,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'tag et flightId sont requis' });
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'baggage');
+    const denial = await stationDenial(flightId, request, 'baggage');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -538,10 +587,20 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
     });
 
     if (decision.confirmBagId) {
-      await supabase
+      // E-04 : ne jamais annoncer « accepté » si la confirmation n'a pas été
+      // écrite. Un faux succès ferait croire le bagage validé alors qu'il ne
+      // l'est pas — le compteur du vol serait faux et le bagage repasserait.
+      const { error: confirmErr } = await supabase
         .from('baggage')
         .update({ is_confirmed: true, tag_number: tag, scanned_by: scannedBy ?? null, scanned_at: new Date().toISOString() })
         .eq('id', decision.confirmBagId);
+      if (confirmErr) {
+        request.log.error({ err: confirmErr, bagId: decision.confirmBagId }, 'Échec confirmation bagage');
+        return reply.code(500).send({
+          status: 'rejected',
+          message: "Échec de l'enregistrement du bagage. Rescannez l'étiquette.",
+        });
+      }
     }
 
     if (decision.fraudAlert) {
@@ -553,7 +612,19 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
         .eq('flight_id', decision.fraudAlert.flight_id)
         .maybeSingle();
       if (!existingAlert) {
-        await supabase.from('fraud_alerts').insert(decision.fraudAlert);
+        // E-04 : si l'insertion de l'alerte échoue, le superviseur ne serait
+        // jamais prévenu d'une fraude. On journalise l'échec et on le dit à
+        // l'agent pour qu'il alerte le superviseur de vive voix. Le rejet du
+        // bagage reste inchangé (il a bien été écarté).
+        const { error: alertErr } = await supabase.from('fraud_alerts').insert(decision.fraudAlert);
+        if (alertErr) {
+          request.log.error({ err: alertErr, tag: decision.fraudAlert.tag_number }, "Échec insertion alerte fraude");
+          const baseMsg = 'message' in decision.result ? decision.result.message : 'Bagage refusé.';
+          return reply.send({
+            ...decision.result,
+            message: `${baseMsg} (Alerte non enregistrée : prévenez le superviseur directement.)`,
+          });
+        }
       }
     }
 
@@ -646,7 +717,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
 
   // ── POST /scan/rush ─── Marquer un bagage restant (Restants) ─
   app.post<{ Body: BaggageActionBody }>('/scan/rush', async (request, reply) => {
-    const denial = await stationDenial(request.body.flightId, request.authAirport, 'rush');
+    const denial = await stationDenial(request.body.flightId, request, 'rush');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -673,7 +744,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ status: 'rejected', message: 'tag et flightId sont requis' } satisfies ExpeditionRushResult);
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'expedition_rush');
+    const denial = await stationDenial(flightId, request, 'expedition_rush');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -980,7 +1051,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ status: 'rejected', message: 'flightId est requis' } satisfies BaggageLoadAllResult);
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'charger');
+    const denial = await stationDenial(flightId, request, 'charger');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -1047,7 +1118,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ status: 'rejected', message: 'soute doit être "avant" ou "arriere"' } satisfies BaggageActionResult);
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'soute');
+    const denial = await stationDenial(flightId, request, 'soute');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -1162,7 +1233,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ status: 'rejected', message: 'tag et flightId sont requis' } satisfies DollyScanResult);
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'dolly');
+    const denial = await stationDenial(flightId, request, 'dolly');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -1318,7 +1389,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ status: 'rejected', message: 'tag et flightId sont requis' } satisfies ArrivalScanResult);
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'arrivee');
+    const denial = await stationDenial(flightId, request, 'arrivee');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -1444,7 +1515,7 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'raw et flightId sont requis' });
     }
 
-    const denial = await stationDenial(flightId, request.authAirport, 'embarquement');
+    const denial = await stationDenial(flightId, request, 'embarquement');
     if (denial) {
       return reply.code(403).send({ error: denial });
     }

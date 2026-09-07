@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { todayAtAirport } from '@police/shared';
 import { authenticate } from '../auth.js';
+import { rateLimitPerUser } from '../rateLimit.js';
 
 // ─────────────────────────────────────────────────────────────
 // Journée d'exploitation, calculée par le serveur.
@@ -29,6 +30,7 @@ export interface OperatingDayResponse {
 
 export async function dayRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', authenticate);
+  app.addHook('preHandler', rateLimitPerUser);
 
   app.get('/operating-day', async (request): Promise<OperatingDayResponse> => ({
     airport: request.authAirport,

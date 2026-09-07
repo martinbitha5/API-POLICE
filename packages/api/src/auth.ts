@@ -28,6 +28,11 @@ declare module 'fastify' {
      * vient de la base, jamais du corps de la requête.
      */
     authAirport: string | null;
+    /**
+     * Compagnie d'affectation du profil. L'API tourne en service_role (ignore la
+     * RLS) : c'est ce champ qui porte le cloisonnement inter-compagnies côté API.
+     */
+    authAirline: string | null;
   }
 }
 
@@ -60,9 +65,9 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
 
   const { data: profile, error: profErr } = await supabase
     .from('profiles')
-    .select('role, airport_code')
+    .select('role, airport_code, airline_code')
     .eq('id', userData.user.id)
-    .single<{ role: UserRole; airport_code: string | null }>();
+    .single<{ role: UserRole; airport_code: string | null; airline_code: string | null }>();
 
   if (profErr || !profile) {
     await reply.code(403).send({ error: 'Profil introuvable' });
@@ -77,4 +82,5 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
   request.authUserId = userData.user.id;
   request.authRole = profile.role;
   request.authAirport = profile.airport_code;
+  request.authAirline = profile.airline_code;
 }

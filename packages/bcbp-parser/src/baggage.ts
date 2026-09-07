@@ -13,6 +13,13 @@ import type { ParsedBaggageTag } from '@police/shared';
 const PHYSICAL_LENGTH = 10;
 const BOARDING_LENGTH = 13;
 
+// N-01 : borne de sécurité sur le nombre de bagages déclaré par une étiquette.
+// Le champ « nombre de bagages » fait 3 chiffres (jusqu'à 999). Sans plafond, une
+// étiquette forgée gonfle declared_baggage_count (source de vérité de la règle
+// anti-fraude n°3) et fait pré-enregistrer des milliers de lignes baggage en un
+// seul scan. Aucun passager réel ne dépasse cette borne.
+export const MAX_DECLARED_BAGGAGE_PER_TAG = 20;
+
 export function parseBaggageTag(tag: string): ParsedBaggageTag {
   if (!/^\d+$/.test(tag)) {
     throw new Error(`Invalid baggage tag: "${tag}" must contain only digits`);
@@ -27,7 +34,10 @@ export function parseBaggageTag(tag: string): ParsedBaggageTag {
     issuerCode: tag[0]!,
     airlineNumericCode: tag.slice(1, 4),
     serialNumber: tag.slice(4, 10), // 6 chiffres = clé de liaison passager ↔ bagage
-    declaredBaggageCount: tag.length === BOARDING_LENGTH ? parseInt(tag.slice(10, 13), 10) : 0,
+    declaredBaggageCount:
+      tag.length === BOARDING_LENGTH
+        ? Math.min(parseInt(tag.slice(10, 13), 10) || 0, MAX_DECLARED_BAGGAGE_PER_TAG)
+        : 0,
     rawTag: tag,
   };
 }

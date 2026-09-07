@@ -1,6 +1,7 @@
 import { decode } from 'bcbp';
 import type { BarcodedBoardingPass, Leg } from 'bcbp';
 import type { ParsedBoardingPass, ParsedBoardingPassLeg } from '@police/shared';
+import { MAX_DECLARED_BAGGAGE_PER_TAG } from './baggage.js';
 
 export function parseBoardingPass(raw: string): ParsedBoardingPass {
   const parsed: BarcodedBoardingPass = decode(raw);
@@ -80,7 +81,9 @@ function countDeclaredBags(parsed: BarcodedBoardingPass): number {
   for (const tag of tags) {
     const digits = (tag ?? '').replace(/\D/g, '');
     if (digits.length >= 13) {
-      total += parseInt(digits.slice(-3), 10) || 0;
+      // N-01 : chaque plage est bornée pour empêcher un boarding pass forgé de
+      // gonfler le quota anti-fraude ou d'amplifier le pré-enregistrement.
+      total += Math.min(parseInt(digits.slice(-3), 10) || 0, MAX_DECLARED_BAGGAGE_PER_TAG);
     }
   }
   return total;
