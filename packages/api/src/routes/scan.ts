@@ -80,6 +80,60 @@ function eitherSerial(serials: string[]): string {
   return serials.flatMap((s) => [`serial_number.eq.${s}`, `rush_serial_number.eq.${s}`]).join(',');
 }
 
+/** Ligne `passengers` réduite à ce que la reconnaissance d'un re-scan utilise. */
+interface ExistingPassengerRow {
+  id: string;
+  seat: string | null;
+  class: string | null;
+  sequence_number: number | null;
+  declared_baggage_count: number;
+  ticket_number: string | null;
+  offloaded: boolean;
+}
+
+const EXISTING_PASSENGER_COLS = 'id, seat, class, sequence_number, declared_baggage_count, ticket_number, offloaded';
+
+/**
+ * Le passager de ce boarding pass est-il déjà enregistré sur ce vol ?
+ *
+ * Identité = billet électronique (13 chiffres). Un changement de siège au
+ * comptoir fait rééditer le boarding pass par Sabre : nouveau siège, souvent
+ * nouveau n° de séquence, parfois plus d'étiquettes. Seul le billet reste.
+ * Constat sur ET70 du 16/09/2026 : 122 lignes pour 112 passagers réels.
+ *
+ * Repli quand le billet ne peut pas trancher : même réservation ET même nom,
+ * sur une ligne dont le billet est inconnu (antérieure à la colonne, ou
+ * boarding pass sans section conditionnelle). Deux billets différents sous le
+ * même nom (père et fils, nom tronqué à 20 caractères) restent deux passagers.
+ */
+async function findExistingPassenger(
+  supabase: SupabaseClient,
+  flightId: string,
+  parsed: { ticketNumber: string; pnr: string; fullName: string },
+): Promise<ExistingPassengerRow | null> {
+  if (parsed.ticketNumber) {
+    const { data } = await supabase
+      .from('passengers')
+      .select(EXISTING_PASSENGER_COLS)
+      .eq('flight_id', flightId)
+      .eq('ticket_number', parsed.ticketNumber)
+      .order('scanned_at', { ascending: true })
+      .limit(1);
+    const row = (data as ExistingPassengerRow[] | null)?.[0];
+    if (row) return row;
+  }
+  const { data } = await supabase
+    .from('passengers')
+    .select(EXISTING_PASSENGER_COLS)
+    .eq('flight_id', flightId)
+    .eq('pnr', parsed.pnr)
+    .eq('full_name', parsed.fullName)
+    .is('ticket_number', null)
+    .order('scanned_at', { ascending: false })
+    .limit(1);
+  return (data as ExistingPassengerRow[] | null)?.[0] ?? null;
+}
+
 /** Ligne `baggage` réduite à ce dont la décision anti-fraude a besoin. */
 interface LinkedBagRow {
   id: string;
@@ -321,30 +375,96 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       });
     }
 
-    const { data: passenger, error } = await supabase
-      .from('passengers')
-      .insert({
-        flight_id: flightId,
-        full_name: parsed.fullName,
-        pnr: parsed.pnr,
-        seat: parsed.seat,
-        class: parsed.class,
-        sequence_number: parsed.sequenceNumber,
-        declared_baggage_count: parsed.declaredBaggageCount,
-        raw_bcbp: parsed.rawBcbp,
-        scanned_by: scannedBy ?? null,
-      })
-      .select()
-      .single();
+    // Même passager déjà enregistré (billet identique) : on met sa ligne à jour
+    // au lieu d'en créer une deuxième. Nouveau siège, nouvelle séquence, nouveau
+    // BCBP brut. Les bagages déjà pré-enregistrés et confirmés restent à lui.
+    const existing = await findExistingPassenger(supabase, flightId, parsed);
+    let passenger: { id: string };
+    let previousSeat: string | null = null;
 
-    if (error) {
-      // 23505 = violation contrainte unique (flight_id, pnr, seat)
-      // → ce passager précis (même siège) a déjà été scanné sur ce vol.
-      if (error.code === '23505') {
+    if (existing) {
+      if (existing.offloaded) {
+        return reply.code(409).send({
+          error: `${parsed.fullName} a été débarqué par le superviseur. Ce billet ne peut pas être ré-enregistré sans lui.`,
+        });
+      }
+
+      // Nombre de bagages déclarés : le boarding pass réédité fait foi quand il
+      // porte ses étiquettes. Sans aucune étiquette (Sabre les omet parfois sur
+      // une réédition après changement de siège), on garde le nombre connu :
+      // le bagage déjà passé au tapis n'a pas disparu. Aucune règle anti-fraude
+      // n'est contournée, le quota ne monte jamais sans étiquette pour le prouver.
+      const declared =
+        parsed.baggageTags.length > 0 ? parsed.declaredBaggageCount : existing.declared_baggage_count;
+
+      const unchanged =
+        (existing.seat ?? '') === parsed.seat &&
+        (existing.class ?? '') === parsed.class &&
+        (existing.sequence_number ?? 0) === parsed.sequenceNumber &&
+        existing.declared_baggage_count === declared;
+      if (unchanged) {
         return reply.code(409).send({ error: 'Ce passager est déjà enregistré.' });
       }
-      request.log.error(error);
-      return reply.code(500).send({ error: "Échec de l'enregistrement du passager" });
+
+      const { data: updated, error } = await supabase
+        .from('passengers')
+        .update({
+          seat: parsed.seat,
+          class: parsed.class,
+          sequence_number: parsed.sequenceNumber,
+          declared_baggage_count: declared,
+          raw_bcbp: parsed.rawBcbp,
+          ticket_number: parsed.ticketNumber || existing.ticket_number,
+        })
+        .eq('id', existing.id)
+        .select('id')
+        .single();
+
+      if (error || !updated) {
+        // 23505 : le nouveau siège est encore tenu par un autre voyageur de la
+        // même réservation (échange de sièges). Son propre re-scan libérera le
+        // siège ; on demande de le passer d'abord.
+        if (error?.code === '23505') {
+          return reply.code(409).send({
+            error: `Le siège ${parsed.seat} est encore attribué à un autre passager de la réservation ${parsed.pnr}. Rescannez d'abord son billet.`,
+          });
+        }
+        request.log.error(error);
+        return reply.code(500).send({ error: "Échec de la mise à jour du passager" });
+      }
+      passenger = updated;
+      previousSeat = existing.seat;
+
+      // La route peut changer avec la réédition : on repart de celle du billet.
+      await supabase.from('passenger_legs').delete().eq('passenger_id', existing.id);
+    } else {
+      const { data: inserted, error } = await supabase
+        .from('passengers')
+        .insert({
+          flight_id: flightId,
+          full_name: parsed.fullName,
+          pnr: parsed.pnr,
+          seat: parsed.seat,
+          class: parsed.class,
+          sequence_number: parsed.sequenceNumber,
+          ticket_number: parsed.ticketNumber || null,
+          declared_baggage_count: parsed.declaredBaggageCount,
+          raw_bcbp: parsed.rawBcbp,
+          scanned_by: scannedBy ?? null,
+        })
+        .select('id')
+        .single();
+
+      if (error || !inserted) {
+        // 23505 = violation contrainte unique (flight_id, pnr, seat) : même
+        // réservation, même siège, mais un autre billet (ou un billet inconnu).
+        if (error?.code === '23505') {
+          return reply.code(409).send({ error: 'Ce passager est déjà enregistré.' });
+        }
+        request.log.error(error);
+        return reply.code(500).send({ error: "Échec de l'enregistrement du passager" });
+      }
+      passenger = inserted;
     }
 
     if (parsed.legs.length > 0) {
@@ -431,6 +551,10 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
         declaredBaggageCount: parsed.declaredBaggageCount,
         legs: parsed.legs,
       },
+      // Re-scan d'un passager connu : l'agent voit que la ligne a été mise à
+      // jour, et l'ancien siège s'il a changé.
+      updated: existing !== null,
+      previousSeat: previousSeat && previousSeat !== parsed.seat ? previousSeat : null,
     });
   });
 
@@ -1546,14 +1670,31 @@ export async function scanRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(result);
     }
 
-    // Identité passager dans un vol = PNR + siège (même clé qu'au check-in).
-    const { data: passenger } = await supabase
-      .from('passengers')
-      .select('id, full_name, seat, boarded, offloaded')
-      .eq('flight_id', flightId)
-      .eq('pnr', parsed.pnr)
-      .eq('seat', parsed.seat)
-      .maybeSingle();
+    // Identité passager dans un vol = billet électronique (même clé qu'au
+    // check-in). Repli sur PNR + siège pour les lignes sans billet connu.
+    const GATE_COLS = 'id, full_name, seat, boarded, offloaded';
+    type GateRow = { id: string; full_name: string; seat: string | null; boarded: boolean; offloaded: boolean };
+    let passenger: GateRow | null = null;
+    if (parsed.ticketNumber) {
+      const { data } = await supabase
+        .from('passengers')
+        .select(GATE_COLS)
+        .eq('flight_id', flightId)
+        .eq('ticket_number', parsed.ticketNumber)
+        .order('scanned_at', { ascending: true })
+        .limit(1);
+      passenger = (data as GateRow[] | null)?.[0] ?? null;
+    }
+    if (!passenger) {
+      const { data } = await supabase
+        .from('passengers')
+        .select(GATE_COLS)
+        .eq('flight_id', flightId)
+        .eq('pnr', parsed.pnr)
+        .eq('seat', parsed.seat)
+        .maybeSingle();
+      passenger = (data as GateRow | null) ?? null;
+    }
 
     if (!passenger) {
       const result: BoardingGateResult = {

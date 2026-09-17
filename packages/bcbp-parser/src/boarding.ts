@@ -19,6 +19,7 @@ export function parseBoardingPass(raw: string): ParsedBoardingPass {
     seat: first.seatNumber ?? '',
     class: first.compartmentCode ?? '',
     sequenceNumber: parseSequence(first.checkInSequenceNumber),
+    ticketNumber: ticketNumber(first),
     declaredBaggageCount: countDeclaredBags(parsed),
     baggageTags: extractBaggageTags(parsed),
     legs: legs.map(mapLeg),
@@ -55,6 +56,20 @@ function formatName(raw: string): string {
 function parseSequence(raw: string | undefined): number {
   const n = parseInt((raw ?? '').trim(), 10);
   return Number.isNaN(n) ? 0 : n;
+}
+
+/**
+ * Billet électronique du leg : code numérique compagnie (3 chiffres) suivi du
+ * n° de document (10 chiffres), champs de la section conditionnelle du BCBP.
+ * Un Sabre qui réédite le boarding pass (changement de siège, nouvelle
+ * séquence, étiquettes absentes) garde ce numéro : c'est lui qui dit « même
+ * passager ». Chaîne vide si l'un des deux champs manque ou n'est pas numérique.
+ */
+function ticketNumber(leg: Leg): string {
+  const airline = (leg.airlineNumericCode ?? '').trim();
+  const serial = (leg.serialNumber ?? '').trim();
+  if (!/^\d{3}$/.test(airline) || !/^\d{10}$/.test(serial)) return '';
+  return `${airline}${serial}`;
 }
 
 /**

@@ -165,6 +165,15 @@ export interface ParsedBoardingPass {
   seat: string;
   class: string;
   sequenceNumber: number;
+  /**
+   * Billet électronique : code numérique compagnie (3) + n° de document (10),
+   * soit 13 chiffres (« 0712163324677 »). C'est l'identité stable d'un
+   * passager dans un vol : elle survit à un changement de siège, à une
+   * réédition du boarding pass et à un nouveau n° de séquence, là où le PNR
+   * est partagé par toute une réservation et le siège change. Chaîne vide si
+   * le boarding pass ne porte pas la section conditionnelle.
+   */
+  ticketNumber: string;
   declaredBaggageCount: number;
   baggageTags: string[];
   legs: ParsedBoardingPassLeg[];
@@ -223,6 +232,8 @@ export interface Passenger {
   seat: string | null;
   class: string | null;
   sequence_number: number | null;
+  /** Billet électronique (13 chiffres), clé d'identité du passager dans le vol. Null sur les lignes antérieures à cette colonne ou sans section conditionnelle. */
+  ticket_number: string | null;
   declared_baggage_count: number;
   raw_bcbp: string | null;
   scanned_at: string;

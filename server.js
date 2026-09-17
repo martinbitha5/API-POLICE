@@ -4,6 +4,7 @@ import Fastify from "fastify";
 // packages/bcbp-parser/src/baggage.ts
 var PHYSICAL_LENGTH = 10;
 var BOARDING_LENGTH = 13;
+var MAX_DECLARED_BAGGAGE_PER_TAG = 20;
 function parseBaggageTag(tag) {
   if (!/^\d+$/.test(tag)) {
     throw new Error(`Invalid baggage tag: "${tag}" must contain only digits`);
@@ -18,7 +19,7 @@ function parseBaggageTag(tag) {
     airlineNumericCode: tag.slice(1, 4),
     serialNumber: tag.slice(4, 10),
     // 6 chiffres = clé de liaison passager ↔ bagage
-    declaredBaggageCount: tag.length === BOARDING_LENGTH ? parseInt(tag.slice(10, 13), 10) : 0,
+    declaredBaggageCount: tag.length === BOARDING_LENGTH ? Math.min(parseInt(tag.slice(10, 13), 10) || 0, MAX_DECLARED_BAGGAGE_PER_TAG) : 0,
     rawTag: tag
   };
 }
@@ -39,6 +40,7 @@ function parseBoardingPass(raw) {
     seat: first.seatNumber ?? "",
     class: first.compartmentCode ?? "",
     sequenceNumber: parseSequence(first.checkInSequenceNumber),
+    ticketNumber: ticketNumber(first),
     declaredBaggageCount: countDeclaredBags(parsed),
     baggageTags: extractBaggageTags(parsed),
     legs: legs.map(mapLeg),
@@ -70,6 +72,12 @@ function parseSequence(raw) {
   const n = parseInt((raw ?? "").trim(), 10);
   return Number.isNaN(n) ? 0 : n;
 }
+function ticketNumber(leg) {
+  const airline = (leg.airlineNumericCode ?? "").trim();
+  const serial = (leg.serialNumber ?? "").trim();
+  if (!/^\d{3}$/.test(airline) || !/^\d{10}$/.test(serial)) return "";
+  return `${airline}${serial}`;
+}
 function countDeclaredBags(parsed) {
   const data = parsed.data;
   if (!data) return 0;
@@ -78,7 +86,7 @@ function countDeclaredBags(parsed) {
   for (const tag of tags) {
     const digits = (tag ?? "").replace(/\D/g, "");
     if (digits.length >= 13) {
-      total += parseInt(digits.slice(-3), 10) || 0;
+      total += Math.min(parseInt(digits.slice(-3), 10) || 0, MAX_DECLARED_BAGGAGE_PER_TAG);
     }
   }
   return total;
@@ -336,7 +344,7 @@ async function authenticate(request, reply) {
     await reply.code(401).send({ error: "Session invalide ou expir\xE9e" });
     return;
   }
-  const { data: profile, error: profErr } = await supabase.from("profiles").select("role, airport_code").eq("id", userData.user.id).single();
+  const { data: profile, error: profErr } = await supabase.from("profiles").select("role, airport_code, airline_code").eq("id", userData.user.id).single();
   if (profErr || !profile) {
     await reply.code(403).send({ error: "Profil introuvable" });
     return;
@@ -348,11 +356,41 @@ async function authenticate(request, reply) {
   request.authUserId = userData.user.id;
   request.authRole = profile.role;
   request.authAirport = profile.airport_code;
+  request.authAirline = profile.airline_code;
+}
+
+// packages/api/src/rateLimit.ts
+var WINDOW_MS = 6e4;
+var MAX_PER_WINDOW = 240;
+var MAX_KEYS = 1e4;
+var hits = /* @__PURE__ */ new Map();
+async function rateLimitPerUser(request, reply) {
+  const key = request.authUserId;
+  if (!key) return;
+  const now = Date.now();
+  const recent = (hits.get(key) ?? []).filter((t) => now - t < WINDOW_MS);
+  if (recent.length >= MAX_PER_WINDOW) {
+    await reply.code(429).send({ error: "Trop de requ\xEAtes. Patientez un instant." });
+    return;
+  }
+  recent.push(now);
+  hits.set(key, recent);
+  if (hits.size > MAX_KEYS) hits.clear();
 }
 
 // packages/api/src/routes/scan.ts
 function eitherSerial(serials) {
   return serials.flatMap((s) => [`serial_number.eq.${s}`, `rush_serial_number.eq.${s}`]).join(",");
+}
+var EXISTING_PASSENGER_COLS = "id, seat, class, sequence_number, declared_baggage_count, ticket_number, offloaded";
+async function findExistingPassenger(supabase, flightId, parsed) {
+  if (parsed.ticketNumber) {
+    const { data: data2 } = await supabase.from("passengers").select(EXISTING_PASSENGER_COLS).eq("flight_id", flightId).eq("ticket_number", parsed.ticketNumber).order("scanned_at", { ascending: true }).limit(1);
+    const row = data2?.[0];
+    if (row) return row;
+  }
+  const { data } = await supabase.from("passengers").select(EXISTING_PASSENGER_COLS).eq("flight_id", flightId).eq("pnr", parsed.pnr).eq("full_name", parsed.fullName).is("ticket_number", null).order("scanned_at", { ascending: false }).limit(1);
+  return data?.[0] ?? null;
 }
 async function findTagOnOtherFlights(supabase, flightId, parsedTag) {
   const { data: current } = await supabase.from("flights").select("date").eq("id", flightId).single();
@@ -385,21 +423,46 @@ async function describeUnlinkedTag(supabase, flightId, parsedTag) {
   }
   return serial >= lo && serial <= hi ? "\xC9tiquette imprim\xE9e au comptoir pour ce vol, mais aucun passager ne l'a d\xE9clar\xE9e. Faire intercepter le colis avant le chargement." : "Cette \xE9tiquette ne vient pas du comptoir de ce vol. Bagage probablement \xE9gar\xE9, \xE0 mettre de c\xF4t\xE9.";
 }
-async function stationDenial(flightId, airport, operation) {
+async function stationDenial(flightId, request, operation) {
   if (!flightId) return null;
-  const { data } = await getSupabase().from("flights").select("origin, destination, stops").eq("id", flightId).maybeSingle();
+  const airport = request.authAirport;
+  const airline = request.authAirline;
+  if (!airport) {
+    return "Compte sans a\xE9roport d'affectation. Contactez un administrateur.";
+  }
+  const { data } = await getSupabase().from("flights").select("origin, destination, stops, airline_code").eq("id", flightId).maybeSingle();
   const flight = data;
-  return flight ? operationDenial(operation, flight, airport) : null;
+  if (!flight) return null;
+  if (flight.airline_code && airline && flight.airline_code !== airline) {
+    return "Ce vol n'appartient pas \xE0 votre compagnie.";
+  }
+  return operationDenial(operation, flight, airport);
+}
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+async function validateScanBody(request, reply) {
+  const b = request.body;
+  if (!b || typeof b !== "object") return;
+  if (b.flightId !== void 0 && (typeof b.flightId !== "string" || !UUID_RE.test(b.flightId))) {
+    await reply.code(400).send({ error: "flightId invalide" });
+    return;
+  }
+  const okStr = (v, max) => v === void 0 || v === null || typeof v === "string" && v.length <= max;
+  if (!okStr(b.raw, 4096) || !okStr(b.tag, 32) || !okStr(b.otherTag, 32) || !okStr(b.gate, 64)) {
+    await reply.code(400).send({ error: "Champ trop long ou invalide" });
+    return;
+  }
 }
 async function scanRoutes(app2) {
   app2.addHook("preHandler", authenticate);
+  app2.addHook("preHandler", rateLimitPerUser);
+  app2.addHook("preHandler", validateScanBody);
   app2.post("/scan/boarding", async (request, reply) => {
     const { raw, flightId } = request.body;
     const scannedBy = request.authUserId;
     if (!raw || !flightId) {
       return reply.code(400).send({ error: "raw et flightId sont requis" });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "checkin");
+    const denial = await stationDenial(flightId, request, "checkin");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -419,23 +482,61 @@ async function scanRoutes(app2) {
         error: `Ce billet est pour le vol ${parsed.flightNumber || "inconnu"}, pas pour ${flight.flight_number}.`
       });
     }
-    const { data: passenger, error } = await supabase.from("passengers").insert({
-      flight_id: flightId,
-      full_name: parsed.fullName,
-      pnr: parsed.pnr,
-      seat: parsed.seat,
-      class: parsed.class,
-      sequence_number: parsed.sequenceNumber,
-      declared_baggage_count: parsed.declaredBaggageCount,
-      raw_bcbp: parsed.rawBcbp,
-      scanned_by: scannedBy ?? null
-    }).select().single();
-    if (error) {
-      if (error.code === "23505") {
+    const existing = await findExistingPassenger(supabase, flightId, parsed);
+    let passenger;
+    let previousSeat = null;
+    if (existing) {
+      if (existing.offloaded) {
+        return reply.code(409).send({
+          error: `${parsed.fullName} a \xE9t\xE9 d\xE9barqu\xE9 par le superviseur. Ce billet ne peut pas \xEAtre r\xE9-enregistr\xE9 sans lui.`
+        });
+      }
+      const declared = parsed.baggageTags.length > 0 ? parsed.declaredBaggageCount : existing.declared_baggage_count;
+      const unchanged = (existing.seat ?? "") === parsed.seat && (existing.class ?? "") === parsed.class && (existing.sequence_number ?? 0) === parsed.sequenceNumber && existing.declared_baggage_count === declared;
+      if (unchanged) {
         return reply.code(409).send({ error: "Ce passager est d\xE9j\xE0 enregistr\xE9." });
       }
-      request.log.error(error);
-      return reply.code(500).send({ error: "\xC9chec de l'enregistrement du passager" });
+      const { data: updated, error } = await supabase.from("passengers").update({
+        seat: parsed.seat,
+        class: parsed.class,
+        sequence_number: parsed.sequenceNumber,
+        declared_baggage_count: declared,
+        raw_bcbp: parsed.rawBcbp,
+        ticket_number: parsed.ticketNumber || existing.ticket_number
+      }).eq("id", existing.id).select("id").single();
+      if (error || !updated) {
+        if (error?.code === "23505") {
+          return reply.code(409).send({
+            error: `Le si\xE8ge ${parsed.seat} est encore attribu\xE9 \xE0 un autre passager de la r\xE9servation ${parsed.pnr}. Rescannez d'abord son billet.`
+          });
+        }
+        request.log.error(error);
+        return reply.code(500).send({ error: "\xC9chec de la mise \xE0 jour du passager" });
+      }
+      passenger = updated;
+      previousSeat = existing.seat;
+      await supabase.from("passenger_legs").delete().eq("passenger_id", existing.id);
+    } else {
+      const { data: inserted, error } = await supabase.from("passengers").insert({
+        flight_id: flightId,
+        full_name: parsed.fullName,
+        pnr: parsed.pnr,
+        seat: parsed.seat,
+        class: parsed.class,
+        sequence_number: parsed.sequenceNumber,
+        ticket_number: parsed.ticketNumber || null,
+        declared_baggage_count: parsed.declaredBaggageCount,
+        raw_bcbp: parsed.rawBcbp,
+        scanned_by: scannedBy ?? null
+      }).select("id").single();
+      if (error || !inserted) {
+        if (error?.code === "23505") {
+          return reply.code(409).send({ error: "Ce passager est d\xE9j\xE0 enregistr\xE9." });
+        }
+        request.log.error(error);
+        return reply.code(500).send({ error: "\xC9chec de l'enregistrement du passager" });
+      }
+      passenger = inserted;
     }
     if (parsed.legs.length > 0) {
       await supabase.from("passenger_legs").insert(
@@ -492,7 +593,11 @@ async function scanRoutes(app2) {
         class: parsed.class,
         declaredBaggageCount: parsed.declaredBaggageCount,
         legs: parsed.legs
-      }
+      },
+      // Re-scan d'un passager connu : l'agent voit que la ligne a été mise à
+      // jour, et l'ancien siège s'il a changé.
+      updated: existing !== null,
+      previousSeat: previousSeat && previousSeat !== parsed.seat ? previousSeat : null
     });
   });
   app2.post("/scan/baggage", async (request, reply) => {
@@ -501,7 +606,7 @@ async function scanRoutes(app2) {
     if (!tag || !flightId) {
       return reply.code(400).send({ error: "tag et flightId sont requis" });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "baggage");
+    const denial = await stationDenial(flightId, request, "baggage");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -579,12 +684,27 @@ async function scanRoutes(app2) {
       tagNote
     });
     if (decision.confirmBagId) {
-      await supabase.from("baggage").update({ is_confirmed: true, tag_number: tag, scanned_by: scannedBy ?? null, scanned_at: (/* @__PURE__ */ new Date()).toISOString() }).eq("id", decision.confirmBagId);
+      const { error: confirmErr } = await supabase.from("baggage").update({ is_confirmed: true, tag_number: tag, scanned_by: scannedBy ?? null, scanned_at: (/* @__PURE__ */ new Date()).toISOString() }).eq("id", decision.confirmBagId);
+      if (confirmErr) {
+        request.log.error({ err: confirmErr, bagId: decision.confirmBagId }, "\xC9chec confirmation bagage");
+        return reply.code(500).send({
+          status: "rejected",
+          message: "\xC9chec de l'enregistrement du bagage. Rescannez l'\xE9tiquette."
+        });
+      }
     }
     if (decision.fraudAlert) {
       const { data: existingAlert } = await supabase.from("fraud_alerts").select("id").eq("tag_number", decision.fraudAlert.tag_number).eq("flight_id", decision.fraudAlert.flight_id).maybeSingle();
       if (!existingAlert) {
-        await supabase.from("fraud_alerts").insert(decision.fraudAlert);
+        const { error: alertErr } = await supabase.from("fraud_alerts").insert(decision.fraudAlert);
+        if (alertErr) {
+          request.log.error({ err: alertErr, tag: decision.fraudAlert.tag_number }, "\xC9chec insertion alerte fraude");
+          const baseMsg = "message" in decision.result ? decision.result.message : "Bagage refus\xE9.";
+          return reply.send({
+            ...decision.result,
+            message: `${baseMsg} (Alerte non enregistr\xE9e : pr\xE9venez le superviseur directement.)`
+          });
+        }
       }
     }
     return reply.send(decision.result);
@@ -636,7 +756,7 @@ async function scanRoutes(app2) {
     };
   }
   app2.post("/scan/rush", async (request, reply) => {
-    const denial = await stationDenial(request.body.flightId, request.authAirport, "rush");
+    const denial = await stationDenial(request.body.flightId, request, "rush");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -649,7 +769,7 @@ async function scanRoutes(app2) {
     if (!tag || !flightId) {
       return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "expedition_rush");
+    const denial = await stationDenial(flightId, request, "expedition_rush");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -829,7 +949,7 @@ async function scanRoutes(app2) {
     if (!flightId) {
       return reply.code(400).send({ status: "rejected", message: "flightId est requis" });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "charger");
+    const denial = await stationDenial(flightId, request, "charger");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -865,7 +985,7 @@ async function scanRoutes(app2) {
     if (soute !== "avant" && soute !== "arriere") {
       return reply.code(400).send({ status: "rejected", message: 'soute doit \xEAtre "avant" ou "arriere"' });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "soute");
+    const denial = await stationDenial(flightId, request, "soute");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -932,7 +1052,7 @@ async function scanRoutes(app2) {
     if (!tag || !flightId) {
       return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "dolly");
+    const denial = await stationDenial(flightId, request, "dolly");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -1026,7 +1146,7 @@ async function scanRoutes(app2) {
     if (!tag || !flightId) {
       return reply.code(400).send({ status: "rejected", message: "tag et flightId sont requis" });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "arrivee");
+    const denial = await stationDenial(flightId, request, "arrivee");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -1106,7 +1226,7 @@ async function scanRoutes(app2) {
     if (!raw || !flightId) {
       return reply.code(400).send({ error: "raw et flightId sont requis" });
     }
-    const denial = await stationDenial(flightId, request.authAirport, "embarquement");
+    const denial = await stationDenial(flightId, request, "embarquement");
     if (denial) {
       return reply.code(403).send({ error: denial });
     }
@@ -1128,7 +1248,16 @@ async function scanRoutes(app2) {
       };
       return reply.send(result2);
     }
-    const { data: passenger } = await supabase.from("passengers").select("id, full_name, seat, boarded, offloaded").eq("flight_id", flightId).eq("pnr", parsed.pnr).eq("seat", parsed.seat).maybeSingle();
+    const GATE_COLS = "id, full_name, seat, boarded, offloaded";
+    let passenger = null;
+    if (parsed.ticketNumber) {
+      const { data } = await supabase.from("passengers").select(GATE_COLS).eq("flight_id", flightId).eq("ticket_number", parsed.ticketNumber).order("scanned_at", { ascending: true }).limit(1);
+      passenger = data?.[0] ?? null;
+    }
+    if (!passenger) {
+      const { data } = await supabase.from("passengers").select(GATE_COLS).eq("flight_id", flightId).eq("pnr", parsed.pnr).eq("seat", parsed.seat).maybeSingle();
+      passenger = data ?? null;
+    }
     if (!passenger) {
       const result2 = {
         status: "rejected",
@@ -1167,6 +1296,7 @@ async function scanRoutes(app2) {
 // packages/api/src/routes/day.ts
 async function dayRoutes(app2) {
   app2.addHook("preHandler", authenticate);
+  app2.addHook("preHandler", rateLimitPerUser);
   app2.get("/operating-day", async (request) => ({
     airport: request.authAirport,
     day: todayAtAirport(request.authAirport),
@@ -1176,7 +1306,18 @@ async function dayRoutes(app2) {
 
 // packages/api/src/server.ts
 function buildServer() {
-  const app2 = Fastify({ logger: true });
+  const app2 = Fastify({
+    logger: true,
+    // F-04 / M-04 : bornes anti-abus. Un scan (BCBP ou tag) est petit ; 64 Ko
+    // laisse une marge confortable tout en coupant les corps démesurés.
+    bodyLimit: 64 * 1024,
+    requestTimeout: 15e3
+  });
+  app2.setErrorHandler((err, request, reply) => {
+    request.log.error(err);
+    const code = typeof err.statusCode === "number" && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 500;
+    reply.code(code).send({ error: code < 500 ? err.message : "Erreur interne" });
+  });
   app2.get("/health", async () => ({ status: "ok" }));
   app2.register(scanRoutes);
   app2.register(dayRoutes);

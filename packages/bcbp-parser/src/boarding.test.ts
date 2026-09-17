@@ -110,6 +110,70 @@ describe('parseBoardingPass', () => {
     expect(parseBoardingPass(raw).declaredBaggageCount).toBe(0);
   });
 
+  it('extrait le billet électronique (code compagnie + n° de document)', () => {
+    const raw = encode({
+      data: {
+        passengerName: 'AFZAL/MUZAHIR MR',
+        legs: [
+          {
+            operatingCarrierPNR: 'KFZVZU',
+            departureAirport: 'FIH',
+            arrivalAirport: 'FKI',
+            operatingCarrierDesignator: 'ET',
+            flightNumber: '0070',
+            compartmentCode: 'Y',
+            seatNumber: '022L',
+            checkInSequenceNumber: '0010',
+            passengerStatus: '1',
+            airlineNumericCode: '071',
+            serialNumber: '2163324677',
+          },
+        ],
+      },
+    });
+
+    expect(parseBoardingPass(raw).ticketNumber).toBe('0712163324677');
+  });
+
+  it('billet vide quand la section conditionnelle manque', () => {
+    const raw = encode({
+      data: {
+        passengerName: 'MUKEBA/JEAN',
+        legs: [
+          {
+            operatingCarrierPNR: 'ABCDEF',
+            departureAirport: 'FIH',
+            arrivalAirport: 'FBM',
+            operatingCarrierDesignator: 'ET',
+            flightNumber: '0062',
+            compartmentCode: 'Y',
+            seatNumber: '007C',
+            checkInSequenceNumber: '0012',
+            passengerStatus: '1',
+          },
+        ],
+      },
+    });
+
+    expect(parseBoardingPass(raw).ticketNumber).toBe('');
+  });
+
+  it('lit le billet sur un boarding pass Sabre réel (réédition après changement de siège)', () => {
+    const first =
+      'M1AFZAL/MUZAHIR MR    EKFZVZU FIHFKIET 0070 259Y023A0014 377>8321OO6259BET 4071165222001                          2A0712163324677 1ET                        N*30601018K0900';
+    const reissued =
+      'M1AFZAL/MUZAHIR MR    EKFZVZU FIHFKIET 0070 259Y022L0010 177>8321OO6259BET                                        2A0712163324677 1ET                        N*306      0900';
+    const a = parseBoardingPass(first);
+    const b = parseBoardingPass(reissued);
+    expect(a.ticketNumber).toBe('0712163324677');
+    expect(b.ticketNumber).toBe(a.ticketNumber);
+    // Tout le reste a changé : c'est bien le billet qui identifie le passager.
+    expect(b.seat).not.toBe(a.seat);
+    expect(b.sequenceNumber).not.toBe(a.sequenceNumber);
+    expect(a.declaredBaggageCount).toBe(1);
+    expect(b.declaredBaggageCount).toBe(0);
+  });
+
   it('lève une erreur si aucun leg', () => {
     expect(() => parseBoardingPass('GARBAGE')).toThrow();
   });
